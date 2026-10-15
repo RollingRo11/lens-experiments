@@ -351,8 +351,9 @@ zero, no weight decay. Started from the identity matrix (the logit lens) or from
   rest switched off, so each matrix also has to work on its own. Batch 256. Trained for 4,000
   steps, then again from scratch for 16,000 steps because the first run had not settled. Training
   curves: W&B runs [swapall_v3](https://wandb.ai/rohan-kathuria-neu/lens-training/runs/lv8vlk9h)
-  and [swapall_v3_16000](https://wandb.ai/rohan-kathuria-neu/lens-training/runs/w8cqoeqo) (the
-  W&B project may not be public).
+  and [swapall_v3_16000](https://wandb.ai/rohan-kathuria-neu/lens-training/runs/w8cqoeqo). All
+  swap-training runs are in the public W&B project
+  [lens-training](https://wandb.ai/rohan-kathuria-neu/lens-training).
 
 ### Results: swapping
 
