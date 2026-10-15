@@ -30,9 +30,17 @@ expert weights did not see. **Right:** the top readout token at seven layers for
 (intermediate "heart"; grey: tokens that Readout Filtering would remove). The J++ Lens reads out
 "heart" at layers 24 and 32; the J-Lens and R-Lens reach only related words, from layer 40.*
 
+## Experiments on Gemma 4 E2B
+
+[WRITEUP.md](WRITEUP.md) describes follow-up experiments on `google/gemma-4-E2B`: other ways to
+cluster activations for J++, learning the lens maps by gradient descent, training them through the
+probe-swap edit, and a scoring fix for models with a logit soft-cap. The code is in `experiments/`
+and in the new fitting modules listed there.
+
 ## Contents
 
 - [Contents](#contents)
+- [Experiments on Gemma 4 E2B](#experiments-on-gemma-4-e2b)
 - [Install](#install)
 - [Quickstart: use the released lens](#quickstart-use-the-released-lens)
 - [The released lens](#the-released-lens)
