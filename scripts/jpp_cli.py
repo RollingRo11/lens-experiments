@@ -25,6 +25,20 @@ hash, a timestamp and the library version beside its output):
   probe-swap     the probe-swap causal eval's trials (.parquet) and success tables
                  (<stem>_success.csv, <stem>_best_scale.csv).
 
+The intervention-trained lens (one map per layer learned by Adam on edit pairs, see
+:mod:`workspace_lens.fitting.intervention_fitting`) adds four stages:
+
+  collect-pairs     a pairs directory: the clean pool (clean_pool.pt), the logit-space
+                    metric (gram.pt) and one subdirectory of edit pairs per family.
+  fit-intervention  a lens (.pt, fp32) fitted on one family's pairs; no model needed.
+  fit-output-kl     the Tuned-Lens-style lens (.pt, fp32) fitted on the clean pool.
+  build-experts     an ExpertJacobians file whose experts are whole lenses, for
+                    fit-weights.
+
+  fit-swap          a lens (.pt, fp32) whose band-layer maps are trained jointly by
+                    descending on the swap loss (:mod:`workspace_lens.fitting.swap_fitting`):
+                    the probe-swap edit on WikiText, rewarding the output moving from X to Y.
+
 Each stage is a library function that takes a ``LensModel`` (so the tests run it on
 tiny CPU models); :func:`main` is the only place a Hugging Face model is loaded.
 
@@ -57,7 +71,13 @@ from lens_evals.causal_evals import (
     probe_swap_success_table,
     run_probe_swap,
 )
-from lens_evals.causal_evals.probe_swap import PROBE_SWAP_SCALES
+from lens_evals.causal_evals.probe_swap import PROBE_SWAP_PATH, PROBE_SWAP_SCALES
+from lens_evals.eval_utils import (
+    formatting_token_ids_of,
+    resolve_swap_token,
+    single_token_ids,
+    surface_forms,
+)
 from lens_evals.readout_evals.readout_eval_items import (
     DEFAULT_FIT_FRACTION,
     MODEL_CORRECTNESS_CSV,
@@ -83,7 +103,30 @@ from workspace_lens.fitting.condense_experts import (
     ExpertWeightingFitter,
 )
 from workspace_lens.fitting.expert_fitting import ExpertJacobianTrainer
+from workspace_lens.fitting.intervention_fitting import (
+    CleanPool,
+    EditFamily,
+    PairsMeta,
+    TransportFit,
+    collect_pairs,
+    fit_intervention_lens,
+    fit_output_kl,
+    heldout_prompt_mask,
+    intervention_lens_config,
+    pairs_path,
+    record_clean_pool,
+    unembed_gram,
+)
 from workspace_lens.fitting.relp_fitting import ExpertJacobianRelPTrainer
+from workspace_lens.fitting.swap_fitting import (
+    SwapExample,
+    SwapFit,
+    draw_swap_examples,
+    fit_swap_maps,
+    full_length_prompts,
+    swap_lens,
+    swap_lens_config,
+)
 from workspace_lens.fitting.utils import (
     expert_checkpoint_filename,
     merge_expert_checkpoints,
@@ -97,7 +140,10 @@ from workspace_lens.routing.router import ActivationRouterCollection
 from workspace_lens.utils import (
     check_model_matches_config,
     ensure_parent_dir,
+    hf_model_name_of,
     load_lens_file,
+    resolve_target_layer,
+    token_id_mask_Bool_V,
     vocab_size_of,
 )
 
@@ -410,6 +456,7 @@ def probe_swap(
     layers: Sequence[int],
     scales: Sequence[float] = PROBE_SWAP_SCALES,
     max_seq_len: int = PROBE_SWAP_MAX_SEQ_LEN,
+    data_path: str = PROBE_SWAP_PATH,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Stage 6: the probe-swap eval, ``(trials_df, success_table)``: the clamp-swap trials
     of every lens at the readout ``layers``
@@ -419,11 +466,387 @@ def probe_swap(
     for lens in lenses.values():
         check_model_matches_config(model, lens.config)
     trials_df, dropped_concepts = run_probe_swap(
-        model, lenses, layers=layers, scales=scales, max_seq_len=max_seq_len
+        model, lenses, layers=layers, scales=scales, max_seq_len=max_seq_len, data_path=data_path
     )
     if dropped_concepts:
         logger.info("probe swap dropped concepts with no single-token form: %s", dropped_concepts)
     return trials_df, probe_swap_success_table(trials_df)
+
+
+### THE INTERVENTION-TRAINED LENS
+
+CLEAN_POOL_FILENAME = "clean_pool.pt"
+GRAM_FILENAME = "gram.pt"
+IDENTITY_INIT = "identity"  # an --init value: start every map at the identity (the Logit Lens)
+
+
+def collect_intervention_pairs(
+    model: LensModel,
+    prompts: Sequence[str],
+    *,
+    families: Sequence[EditFamily],
+    layers: Sequence[int],
+    hf_model_name: str,
+    out_dir: str,
+    target_offset: int = -1,
+    pairs_per_prompt: int = 32,
+    rows_per_pass: int = 128,
+    max_seq_len: int = RECIPE_MAX_SEQ_LEN,
+    skip_first_n_positions: int = RECIPE_SKIP_FIRST_N_POSITIONS,
+    seed: int = 0,
+) -> dict[str, object]:
+    """Stage: the clean pool (recorded once and reused by later calls on the same
+    ``out_dir``, which must then have the same prompts and settings), the logit-space
+    metric, and each family's pairs under ``<out_dir>/<family.label>/`` with its
+    ``meta.json``. Returns the collection diagnostics."""
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    target_layer = resolve_target_layer(model.n_layers, target_offset)
+    pool_meta = PairsMeta(
+        hf_model_name=hf_model_name,
+        d_model=model.d_model,
+        layers=list(layers),
+        relative_end_transport_layer=target_offset,
+        max_seq_len=max_seq_len,
+        skip_first_n_positions=skip_first_n_positions,
+        num_prompts=len(prompts),
+        family="clean",
+        pairs_per_prompt=0,
+        seed=seed,
+    )
+    pool_path = out_path / CLEAN_POOL_FILENAME
+    if pool_path.exists():
+        existing_meta = PairsMeta.load(out_path)
+        if dataclasses.replace(existing_meta, seed=seed) != pool_meta:
+            raise ValueError(f"{pool_path} was recorded with {existing_meta}, not {pool_meta}")
+        pool = CleanPool.load(pool_path)
+        logger.info("clean pool loaded from %s (%d rows)", pool_path, len(pool.prompt_idx_Int_R))
+    else:
+        pool_start_time = datetime.now(UTC)
+        pool = record_clean_pool(
+            model,
+            prompts,
+            layers=layers,
+            target_layer=target_layer,
+            max_seq_len=max_seq_len,
+            skip_first_n_positions=skip_first_n_positions,
+        )
+        pool.save(pool_path)
+        pool_meta.save(out_path)
+        logger.info(
+            "clean pool: %d rows in %.0fs, saved to %s",
+            len(pool.prompt_idx_Int_R),
+            (datetime.now(UTC) - pool_start_time).total_seconds(),
+            pool_path,
+        )
+    gram_path = out_path / GRAM_FILENAME
+    if not gram_path.exists() and hasattr(model, "_lm_head"):
+        t.save(unembed_gram(model), gram_path)
+
+    pairs_by_family, stats = collect_pairs(
+        model,
+        prompts,
+        pool,
+        families=families,
+        layers=layers,
+        target_layer=target_layer,
+        pairs_per_prompt=pairs_per_prompt,
+        rows_per_pass=rows_per_pass,
+        max_seq_len=max_seq_len,
+        skip_first_n_positions=skip_first_n_positions,
+        seed=seed,
+    )
+    for family in families:
+        family_dir = out_path / family.label
+        family_dir.mkdir(exist_ok=True)
+        for layer, layer_pairs in pairs_by_family[family.label].items():
+            layer_pairs.save(pairs_path(family_dir, layer))
+        dataclasses.replace(
+            pool_meta, family=family.label, pairs_per_prompt=pairs_per_prompt
+        ).save(family_dir)
+    seconds = stats.seconds_per_prompt
+    return {
+        "families": [family.label for family in families],
+        "num_prompts_with_pairs": len(seconds),
+        "mean_seconds_per_prompt": sum(seconds) / len(seconds),
+        "max_leak": stats.max_leak,
+        "max_abs_y": stats.max_abs_y,
+    }
+
+
+def _init_lens(init: str, *, hf_model_name: str, d_model: int) -> JacobianLens | None:
+    """``--init``: ``None`` for :data:`IDENTITY_INIT`, else the Jacobian-format lens
+    file at that path."""
+    if init == IDENTITY_INIT:
+        return None
+    lens = load_lens_file(init, hf_model_name=hf_model_name)
+    if not isinstance(lens, JacobianLens) or lens.d_model != d_model:
+        raise ValueError(f"--init {init} is not a d_model={d_model} Jacobian lens")
+    return lens
+
+
+def fit_intervention(
+    pairs_dirs: str | Sequence[str],
+    *,
+    layers: Sequence[int],
+    checkpoint_name: str,
+    target: str = "sum_future",
+    loss: str = "residual",
+    init: str = IDENTITY_INIT,
+    holdout_fraction: float = 0.1,
+    holdout_seed: int = 0,
+    device: str = DEFAULT_MERGE_DEVICE,
+    **fit_kwargs: object,
+) -> tuple[JacobianLens, dict[int, TransportFit]]:
+    """Stage: fit a lens on one family's pairs, or on several families' pairs pooled
+    (:func:`fit_intervention_lens`), from the identity or from the lens file ``init``.
+    Needs no model: the pairs directories carry the settings, and the logit loss reads
+    the first one's parent's ``gram.pt``."""
+    if isinstance(pairs_dirs, str):
+        pairs_dirs = [pairs_dirs]
+    meta = PairsMeta.load(pairs_dirs[0])
+    return fit_intervention_lens(
+        pairs_dirs,
+        layers=layers,
+        target=target,  # type: ignore[arg-type]
+        loss=loss,  # type: ignore[arg-type]
+        init_lens=_init_lens(init, hf_model_name=meta.hf_model_name, d_model=meta.d_model),
+        checkpoint_name=checkpoint_name,
+        holdout_fraction=holdout_fraction,
+        holdout_seed=holdout_seed,
+        device=device,
+        **fit_kwargs,
+    )
+
+
+def fit_output_kl_lens(
+    model: LensModel,
+    pool_dir: str,
+    *,
+    layers: Sequence[int],
+    checkpoint_name: str,
+    init: str = IDENTITY_INIT,
+    holdout_fraction: float = 0.1,
+    holdout_seed: int = 0,
+    **fit_kwargs: object,
+) -> tuple[JacobianLens, dict[int, TransportFit]]:
+    """Stage: the Tuned-Lens-style lens on a pairs directory's clean pool
+    (:func:`fit_output_kl` per layer), with the same held-out prompts as
+    :func:`fit_intervention` for the same fraction and seed."""
+    meta = PairsMeta.load(pool_dir)
+    model_name = hf_model_name_of(model)
+    if model.d_model != meta.d_model or (model_name is not None and model_name != meta.hf_model_name):
+        raise ValueError(f"the pool was recorded on {meta.hf_model_name}, not this model")
+    pool = CleanPool.load(Path(pool_dir) / CLEAN_POOL_FILENAME)
+    heldout_prompts_Bool = heldout_prompt_mask(meta.num_prompts, holdout_fraction, seed=holdout_seed)
+    init_lens = _init_lens(init, hf_model_name=meta.hf_model_name, d_model=meta.d_model)
+    fits_L_dict: dict[int, TransportFit] = {}
+    for layer in layers:
+        init_FN = (
+            init_lens.jacobians_L_dict_FN[layer]  # type: ignore[index]
+            if init_lens is not None
+            else t.eye(meta.d_model)
+        )
+        fits_L_dict[layer] = fit_output_kl(
+            model,
+            pool,
+            layer=layer,
+            heldout_prompts_Bool=heldout_prompts_Bool,
+            init_FN=init_FN,
+            **fit_kwargs,  # type: ignore[arg-type]
+        )
+        logger.info(
+            "  layer %d: held-out KL %.4f (init) -> %.4f (step %d)",
+            layer,
+            fits_L_dict[layer].init_heldout_relative_error,
+            fits_L_dict[layer].best_heldout_relative_error,
+            fits_L_dict[layer].best_step,
+        )
+    lens = JacobianLens(
+        jacobians={layer: fit.matrix_FN for layer, fit in fits_L_dict.items()},
+        config=intervention_lens_config(
+            meta,
+            checkpoint_name=checkpoint_name,
+            num_prompts_trained_on=int((~heldout_prompts_Bool).sum()),
+        ),
+    )
+    return lens, fits_L_dict
+
+
+def swap_examples_from_items(
+    model: LensModel, items: Sequence[dict], *, max_seq_len: int
+) -> tuple[list[str], list[SwapExample]]:
+    """``(prompts, examples)`` for the supervised swap loss from items in the probe-swap
+    format: X and Y resolved to their swap tokens as probe-swap does
+    (:func:`resolve_swap_token`), the answer ids every single-token surface of Y's answer
+    (``swap_answer_surfaces`` when given, else ``swap_answer``), read at the last position.
+    Items with no swap token or answer token are dropped (logged)."""
+    prompts = sorted({item["prompt"] for item in items})
+    prompt_index = {prompt: idx for idx, prompt in enumerate(prompts)}
+    examples: list[SwapExample] = []
+    for item in items:
+        source_id, _ = resolve_swap_token(model.tokenizer, item["intermediate"])
+        target_id, _ = resolve_swap_token(model.tokenizer, item["swap_to"])
+        answers = item.get("swap_answer_surfaces") or [item["swap_answer"]]
+        answer_ids = sorted(
+            {token_id for answer in answers for token_id in single_token_ids(model.tokenizer, surface_forms(answer))}
+        )
+        if source_id is None or target_id is None or not answer_ids:
+            logger.warning("dropping swap item %s: no single-token swap or answer form", item.get("name"))
+            continue
+        position = model.encode(item["prompt"], max_length=max_seq_len).shape[1] - 1
+        examples.append(
+            SwapExample(prompt_index[item["prompt"]], position, source_id, target_id, tuple(answer_ids))
+        )
+    return prompts, examples
+
+
+def fit_swap(
+    model: LensModel,
+    prompts: Sequence[str],
+    *,
+    layers: Sequence[int],
+    hf_model_name: str,
+    checkpoint_name: str,
+    mode: str = "next_token",
+    init: str = IDENTITY_INIT,
+    examples_per_prompt: int = 8,
+    top_k: int = 20,
+    window: int = 8,
+    max_seq_len: int = RECIPE_MAX_SEQ_LEN,
+    skip_first_n_positions: int = RECIPE_SKIP_FIRST_N_POSITIONS,
+    holdout_fraction: float = 0.1,
+    holdout_seed: int = 0,
+    num_heldout_examples: int = 256,
+    seed: int = 0,
+    swap_items: Sequence[dict] | None = None,
+    monitor_items: Sequence[dict] | None = None,
+    **fit_kwargs: object,
+) -> tuple[JacobianLens, SwapFit]:
+    """Stage: the swap-trained lens. Prompts that fill ``max_seq_len`` tokens are split
+    into training and held-out prompts (:func:`heldout_prompt_mask`, the split the other
+    intervention stages use); swap examples are drawn from each
+    (:func:`draw_swap_examples`, X and Y never formatting tokens); the band layers' maps
+    start from the identity or from the lens file ``init`` and are trained jointly
+    (:func:`fit_swap_maps`). In supervised mode the rows are ``swap_items`` instead (a built
+    swap dataset, :func:`swap_examples_from_items`), a seeded ``holdout_fraction`` of them
+    held out for early stopping; ``prompts`` is then ignored. ``monitor_items`` (swap items
+    from held-out relations) are scored along the way and logged, never trained on."""
+    vocab_size = vocab_size_of(model)
+    excluded_mask_Bool_V = token_id_mask_Bool_V(formatting_token_ids_of(model.tokenizer, vocab_size), vocab_size)
+    if mode == "supervised":
+        if swap_items is None:
+            raise ValueError("supervised mode needs swap_items")
+        prompts, examples = swap_examples_from_items(model, swap_items, max_seq_len=max_seq_len)
+        order = t.randperm(len(examples), generator=t.Generator().manual_seed(holdout_seed)).tolist()
+        num_heldout = max(1, round(holdout_fraction * len(examples)))
+        heldout_examples = [examples[i] for i in order[:num_heldout]][:num_heldout_examples]
+        train_examples = [examples[i] for i in order[num_heldout:]]
+        num_training_prompts = len({example.prompt_idx for example in train_examples})
+        logger.info("swap examples: %d training, %d held out", len(train_examples), len(heldout_examples))
+    else:
+        train_examples, heldout_examples, num_training_prompts = _draw_wikitext_swap_examples(
+            model,
+            prompts,
+            mode=mode,
+            examples_per_prompt=examples_per_prompt,
+            top_k=top_k,
+            excluded_mask_Bool_V=excluded_mask_Bool_V,
+            window=window,
+            max_seq_len=max_seq_len,
+            skip_first_n_positions=skip_first_n_positions,
+            holdout_fraction=holdout_fraction,
+            holdout_seed=holdout_seed,
+            num_heldout_examples=num_heldout_examples,
+            seed=seed,
+        )
+    monitor_examples: list[SwapExample] = []
+    if monitor_items:
+        monitor_prompts, monitor_examples = swap_examples_from_items(model, monitor_items, max_seq_len=max_seq_len)
+        offset = len(prompts)
+        prompts = [*prompts, *monitor_prompts]
+        monitor_examples = [
+            dataclasses.replace(example, prompt_idx=example.prompt_idx + offset)
+            for example in monitor_examples[:num_heldout_examples]
+        ]
+    init_lens = _init_lens(init, hf_model_name=hf_model_name, d_model=model.d_model)
+    init_maps_L_dict_FN = {
+        layer: (
+            init_lens.jacobians_L_dict_FN[layer]  # type: ignore[index]
+            if init_lens is not None
+            else t.eye(model.d_model)
+        )
+        for layer in layers
+    }
+    fit = fit_swap_maps(
+        model,
+        prompts,
+        train_examples,
+        heldout_examples,
+        init_maps_L_dict_FN=init_maps_L_dict_FN,
+        mode=mode,  # type: ignore[arg-type]
+        window=window,
+        max_seq_len=max_seq_len,
+        seed=seed,
+        excluded_mask_Bool_V=excluded_mask_Bool_V,
+        monitor_examples=monitor_examples,
+        **fit_kwargs,  # type: ignore[arg-type]
+    )
+    config = swap_lens_config(
+        hf_model_name=hf_model_name,
+        checkpoint_name=checkpoint_name,
+        layers=layers,
+        d_model=model.d_model,
+        num_prompts_trained_on=num_training_prompts,
+        max_seq_len=max_seq_len,
+        skip_first_n_positions=skip_first_n_positions,
+    )
+    return swap_lens(fit, config), fit
+
+
+def _draw_wikitext_swap_examples(
+    model: LensModel,
+    prompts: Sequence[str],
+    *,
+    mode: str,
+    examples_per_prompt: int,
+    top_k: int,
+    excluded_mask_Bool_V: t.Tensor,
+    window: int,
+    max_seq_len: int,
+    skip_first_n_positions: int,
+    holdout_fraction: float,
+    holdout_seed: int,
+    num_heldout_examples: int,
+    seed: int,
+) -> tuple[list[SwapExample], list[SwapExample], int]:
+    """The next_token / counterfactual rows: training and held-out examples from the
+    full-length training and held-out prompts, and the number of training prompts."""
+    full_length = full_length_prompts(model, prompts, max_seq_len)
+    heldout_prompts_Bool = heldout_prompt_mask(len(prompts), holdout_fraction, seed=holdout_seed)
+    train_indices = [idx for idx in full_length if not heldout_prompts_Bool[idx]]
+    heldout_indices = [idx for idx in full_length if heldout_prompts_Bool[idx]]
+    draw_kwargs = dict(
+        mode=mode,
+        examples_per_prompt=examples_per_prompt,
+        top_k=top_k,
+        excluded_mask_Bool_V=excluded_mask_Bool_V.cpu(),
+        max_seq_len=max_seq_len,
+        skip_first_n_positions=skip_first_n_positions,
+        window=window,
+    )
+    train_examples = draw_swap_examples(model, prompts, train_indices, seed=seed, **draw_kwargs)  # type: ignore[arg-type]
+    heldout_examples = draw_swap_examples(model, prompts, heldout_indices, seed=seed + 1, **draw_kwargs)  # type: ignore[arg-type]
+    heldout_examples = heldout_examples[:num_heldout_examples]
+    logger.info(
+        "swap examples: %d training (%d prompts), %d held out (%d of %d prompts full length)",
+        len(train_examples),
+        len(train_indices),
+        len(heldout_examples),
+        len(full_length),
+        len(prompts),
+    )
+    return train_examples, heldout_examples, len(train_indices)
 
 
 ### STAMPS
@@ -810,13 +1233,194 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-seq-len", type=int, default=PROBE_SWAP_MAX_SEQ_LEN, help="Default %(default)s."
     )
     probe_swap_parser.add_argument(
+        "--data",
+        default=PROBE_SWAP_PATH,
+        help="Swap items in the probe-swap JSON format (e.g. a held-out swap dataset). "
+        "Default %(default)s.",
+    )
+    probe_swap_parser.add_argument(
         "--out",
         required=True,
         help="Trials parquet path; <stem>_success.csv, <stem>_best_scale.csv and the stamp are "
         "written beside it.",
     )
 
+    _add_intervention_parsers(subparsers)
     return parser
+
+
+def _add_fit_loop_arguments(
+    parser: argparse.ArgumentParser, *, steps: int, batch_size: int, eval_every: int, patience: int
+) -> None:
+    """The Adam loop's flags, shared by fit-intervention and fit-output-kl."""
+    parser.add_argument(
+        "--init",
+        default=IDENTITY_INIT,
+        help=f"'{IDENTITY_INIT}' or a lens .pt to start every map from. Default %(default)s.",
+    )
+    parser.add_argument("--steps", type=int, default=steps)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch-size", type=int, default=batch_size)
+    parser.add_argument("--eval-every", type=int, default=eval_every)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=patience,
+        help="Stop after this many evaluations without a better held-out loss. Default %(default)s.",
+    )
+    parser.add_argument("--holdout-fraction", type=float, default=0.1)
+    parser.add_argument("--holdout-seed", type=int, default=0)
+    parser.add_argument("--checkpoint-name", required=True)
+    parser.add_argument(
+        "--out",
+        required=True,
+        help="Lens .pt path (saved fp32); <stem>_fit_history.json and the stamp are written "
+        "beside it.",
+    )
+
+
+def _add_intervention_parsers(subparsers: argparse._SubParsersAction) -> None:
+    collect_parser = subparsers.add_parser(
+        "collect-pairs", help="Record the clean pool and the edit pairs of the intervention-trained lens."
+    )
+    _add_model_argument(collect_parser)
+    _add_layers_argument(collect_parser)
+    collect_parser.add_argument("--num-prompts", type=int, default=1024)
+    collect_parser.add_argument(
+        "--prompts-json", default=None, help="Read the prompt pool from this JSON list. Default: stream WikiText."
+    )
+    collect_parser.add_argument(
+        "--families",
+        default="gauss:0.05,swap:1",
+        help="Comma-separated edit families: 'swap:<alpha>', 'gauss:<size>', 'zero', 'mean'. "
+        "Default %(default)s.",
+    )
+    collect_parser.add_argument("--pairs-per-prompt", type=int, default=32)
+    collect_parser.add_argument(
+        "--rows-per-pass",
+        type=int,
+        default=128,
+        help="Batch rows per forward pass (one clean row plus edits). Default %(default)s.",
+    )
+    collect_parser.add_argument("--target-offset", type=int, default=-1)
+    collect_parser.add_argument("--max-seq-len", type=int, default=RECIPE_MAX_SEQ_LEN)
+    collect_parser.add_argument(
+        "--skip-first-n-positions", type=int, default=RECIPE_SKIP_FIRST_N_POSITIONS
+    )
+    collect_parser.add_argument("--seed", type=int, default=0)
+    collect_parser.add_argument("--out-dir", required=True)
+
+    fit_parser = subparsers.add_parser(
+        "fit-intervention", help="Fit the intervention-trained lens on one family's pairs (no model)."
+    )
+    _add_layers_argument(fit_parser)
+    fit_parser.add_argument(
+        "--pairs-dir",
+        nargs="+",
+        required=True,
+        help="One family's directory from collect-pairs, or several to fit on their pairs pooled.",
+    )
+    fit_parser.add_argument("--target", choices=["sum_future", "same_position"], default="sum_future")
+    fit_parser.add_argument("--loss", choices=["residual", "logit"], default="residual")
+    fit_parser.add_argument("--device", default=DEFAULT_MERGE_DEVICE)
+    _add_fit_loop_arguments(fit_parser, steps=5000, batch_size=1024, eval_every=50, patience=20)
+
+    kl_parser = subparsers.add_parser(
+        "fit-output-kl", help="Fit the Tuned-Lens-style lens (KL to the model's own output) on the clean pool."
+    )
+    _add_model_argument(kl_parser)
+    _add_layers_argument(kl_parser)
+    kl_parser.add_argument("--pool-dir", required=True, help="The collect-pairs --out-dir.")
+    _add_fit_loop_arguments(kl_parser, steps=2000, batch_size=256, eval_every=100, patience=10)
+
+    experts_parser = subparsers.add_parser(
+        "build-experts", help="An ExpertJacobians file whose experts are whole lenses (for fit-weights)."
+    )
+    _add_layers_argument(experts_parser)
+    experts_parser.add_argument("--hf-model-name", default=RECIPE_HF_MODEL_NAME)
+    experts_parser.add_argument("--lens", nargs="+", required=True, help="Lens .pt files, one per expert.")
+    experts_parser.add_argument("--out", required=True)
+
+    swap_parser = subparsers.add_parser(
+        "fit-swap", help="Train the band layers' maps by descending on the swap loss (probe-swap's edit on WikiText)."
+    )
+    _add_model_argument(swap_parser)
+    _add_layers_argument(swap_parser)
+    swap_parser.add_argument("--num-prompts", type=int, default=1024)
+    swap_parser.add_argument("--prompts-json", default=None)
+    swap_parser.add_argument(
+        "--mode",
+        choices=["next_token", "counterfactual", "supervised"],
+        default="next_token",
+        help="next_token: X is the model's top prediction at s, the loss is Y's cross-entropy "
+        "there. counterfactual: X is the token at s, the target is the run with Y written at s "
+        "(KL over --window positions). supervised: rows from --swap-data, the loss is the "
+        "cross-entropy of Y's answer at the last position. Default %(default)s.",
+    )
+    swap_parser.add_argument(
+        "--swap-data", default=None, help="Supervised mode: swap items in the probe-swap JSON format."
+    )
+    swap_parser.add_argument(
+        "--monitor-data",
+        default=None,
+        help="Swap items (e.g. held-out relations) scored at every evaluation and logged, never "
+        "trained on or used for stopping.",
+    )
+    swap_parser.add_argument("--init", default=IDENTITY_INIT)
+    swap_parser.add_argument("--examples-per-prompt", type=int, default=8)
+    swap_parser.add_argument("--top-k", type=int, default=20, help="Y is drawn from these top candidates.")
+    swap_parser.add_argument("--scale", type=float, default=1.0, help="The clamp swap's scale.")
+    swap_parser.add_argument("--window", type=int, default=8)
+    swap_parser.add_argument("--max-seq-len", type=int, default=RECIPE_MAX_SEQ_LEN)
+    swap_parser.add_argument("--skip-first-n-positions", type=int, default=RECIPE_SKIP_FIRST_N_POSITIONS)
+    swap_parser.add_argument("--steps", type=int, default=2000)
+    swap_parser.add_argument("--batch-size", type=int, default=16)
+    swap_parser.add_argument(
+        "--length-pool",
+        type=int,
+        default=32,
+        help="Draw this many batches' rows at once and group them by prompt length, so batches "
+        "carry little padding (1: every batch drawn on its own). Default %(default)s.",
+    )
+    swap_parser.add_argument(
+        "--clean-cache-gb",
+        type=float,
+        default=40.0,
+        help="Run every prompt's clean pass once and keep it on the GPU when it takes at most this "
+        "many GB and fits next to training (measured); 0: run it every step. Default %(default)s.",
+    )
+    swap_parser.add_argument(
+        "--edit-precision",
+        choices=["fp32", "model"],
+        default="fp32",
+        help="Dtype of the swap edit's products with the residuals: fp32, or the model's own "
+        "(bf16, faster). Default %(default)s.",
+    )
+    swap_parser.add_argument(
+        "--relative-lr", type=float, default=1e-2, help="Adam's step relative to each map's entry RMS."
+    )
+    swap_parser.add_argument(
+        "--all-layers-probability",
+        type=float,
+        default=1.0,
+        help="Share of steps that swap at every layer; the rest swap at one random window of "
+        "--window-sizes consecutive layers. Default %(default)s (always every layer).",
+    )
+    swap_parser.add_argument(
+        "--window-sizes", type=parse_int_list, default=[], help="e.g. 1,3,5 (see --all-layers-probability)."
+    )
+    swap_parser.add_argument("--eval-every", type=int, default=100)
+    swap_parser.add_argument("--patience", type=int, default=5)
+    swap_parser.add_argument("--holdout-fraction", type=float, default=0.1)
+    swap_parser.add_argument("--holdout-seed", type=int, default=0)
+    swap_parser.add_argument("--heldout-examples", type=int, default=256)
+    swap_parser.add_argument("--seed", type=int, default=0)
+    swap_parser.add_argument(
+        "--wandb-project", default=None, help="Log the training curves to this W&B project (needs the tracking extra)."
+    )
+    swap_parser.add_argument("--wandb-run-name", default=None, help="Default: --checkpoint-name.")
+    swap_parser.add_argument("--checkpoint-name", required=True)
+    swap_parser.add_argument("--out", required=True)
 
 
 def _add_scoring_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1146,7 +1750,12 @@ def _run_probe_swap(args: argparse.Namespace) -> None:
     model = _load_model(args)
     lenses = load_lenses(args.lens, model, hf_model_name=args.hf_model_name, layers=args.layers)
     trials_df, success_df = probe_swap(
-        model, lenses, layers=args.layers, scales=args.scales, max_seq_len=args.max_seq_len
+        model,
+        lenses,
+        layers=args.layers,
+        scales=args.scales,
+        max_seq_len=args.max_seq_len,
+        data_path=args.data,
     )
     best_df = best_scale_rows(success_df)
     success_path = sibling_path(args.out, "_success.csv")
@@ -1159,6 +1768,184 @@ def _run_probe_swap(args: argparse.Namespace) -> None:
     print(best_df.to_string(index=False))
 
 
+def _run_collect_pairs(args: argparse.Namespace) -> None:
+    prompts = (
+        load_fit_prompts_from_json(args.prompts_json, args.num_prompts)
+        if args.prompts_json is not None
+        else load_fit_prompts(args.num_prompts)
+    )
+    families = [EditFamily.parse(text) for text in args.families.split(",")]
+    stats = collect_intervention_pairs(
+        _load_model(args),
+        prompts,
+        families=families,
+        layers=args.layers,
+        hf_model_name=args.hf_model_name,
+        out_dir=args.out_dir,
+        target_offset=args.target_offset,
+        pairs_per_prompt=args.pairs_per_prompt,
+        rows_per_pass=args.rows_per_pass,
+        max_seq_len=args.max_seq_len,
+        skip_first_n_positions=args.skip_first_n_positions,
+        seed=args.seed,
+    )
+    stamp_path = os.path.join(args.out_dir, f"collect_pairs_{'_'.join(stats['families'])}_stamp.json")
+    write_stamp(stamp_path, {"stage": args.stage, "args": vars(args), **stats})
+    logger.info("pairs in %s: %s", args.out_dir, stats)
+
+
+def _fit_loop_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "steps": args.steps,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "eval_every": args.eval_every,
+        "patience": args.patience,
+    }
+
+
+def _write_fitted_lens(
+    args: argparse.Namespace, lens: JacobianLens, fits_L_dict: dict[int, TransportFit]
+) -> None:
+    """The lens in fp32, its per-layer fit history beside it, and the stamp (with the
+    held-out errors at the init and at the kept step)."""
+    history_path = sibling_path(args.out, "_fit_history.json")
+    summary = {
+        str(layer): {
+            "best_step": fit.best_step,
+            "init_heldout": fit.init_heldout_relative_error,
+            "best_heldout": fit.best_heldout_relative_error,
+            "lstsq_heldout": fit.lstsq_heldout_relative_error,
+        }
+        for layer, fit in fits_L_dict.items()
+    }
+    write_stage_stamp(args, args.out, fit_history_path=history_path, heldout=summary)
+    lens.save(args.out, dtype=t.float32)
+    Path(history_path).write_text(
+        json.dumps({str(layer): fit.history for layer, fit in fits_L_dict.items()})
+    )
+    logger.info("lens saved to %s (history %s)", args.out, history_path)
+
+
+def _run_fit_intervention(args: argparse.Namespace) -> None:
+    lens, fits_L_dict = fit_intervention(
+        args.pairs_dir,
+        layers=args.layers,
+        checkpoint_name=args.checkpoint_name,
+        target=args.target,
+        loss=args.loss,
+        init=args.init,
+        holdout_fraction=args.holdout_fraction,
+        holdout_seed=args.holdout_seed,
+        device=args.device,
+        **_fit_loop_kwargs(args),
+    )
+    _write_fitted_lens(args, lens, fits_L_dict)
+
+
+def _run_fit_output_kl(args: argparse.Namespace) -> None:
+    lens, fits_L_dict = fit_output_kl_lens(
+        _load_model(args),
+        args.pool_dir,
+        layers=args.layers,
+        checkpoint_name=args.checkpoint_name,
+        init=args.init,
+        holdout_fraction=args.holdout_fraction,
+        holdout_seed=args.holdout_seed,
+        **_fit_loop_kwargs(args),
+    )
+    _write_fitted_lens(args, lens, fits_L_dict)
+
+
+def _run_build_experts(args: argparse.Namespace) -> None:
+    _check_lens_files_exist(args.lens)
+    lenses = [load_lens_file(path, hf_model_name=args.hf_model_name) for path in args.lens]
+    if not all(isinstance(lens, JacobianLens) for lens in lenses):
+        raise SystemExit("build-experts takes Jacobian-format lenses only")
+    expert_jacobians = ExpertJacobians.from_lenses(lenses, layers=args.layers)  # type: ignore[arg-type]
+    write_stage_stamp(args, args.out, experts=list(args.lens))
+    expert_jacobians.save(args.out)
+    logger.info("experts (%d lenses) saved to %s", len(lenses), args.out)
+
+
+def _wandb_run(args: argparse.Namespace) -> object | None:
+    """A W&B run for ``--wandb-project`` (``None`` without it), configured with the stage's
+    arguments. Imported lazily: wandb is the optional ``tracking`` extra."""
+    if args.wandb_project is None:
+        return None
+    import wandb
+
+    return wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name or args.checkpoint_name,
+        config={key: value for key, value in vars(args).items() if not key.startswith("wandb")},
+    )
+
+
+def _run_fit_swap(args: argparse.Namespace) -> None:
+    run = _wandb_run(args)
+    if args.mode == "supervised":
+        prompts: list[str] = []  # the rows come from --swap-data
+    elif args.prompts_json is not None:
+        prompts = load_fit_prompts_from_json(args.prompts_json, args.num_prompts)
+    else:
+        prompts = load_fit_prompts(args.num_prompts)
+    lens, fit = fit_swap(
+        _load_model(args),
+        prompts,
+        layers=args.layers,
+        hf_model_name=args.hf_model_name,
+        checkpoint_name=args.checkpoint_name,
+        mode=args.mode,
+        init=args.init,
+        examples_per_prompt=args.examples_per_prompt,
+        top_k=args.top_k,
+        window=args.window,
+        max_seq_len=args.max_seq_len,
+        skip_first_n_positions=args.skip_first_n_positions,
+        holdout_fraction=args.holdout_fraction,
+        holdout_seed=args.holdout_seed,
+        num_heldout_examples=args.heldout_examples,
+        seed=args.seed,
+        log_fn=(lambda metrics: run.log(metrics, step=int(metrics["step"]))) if run is not None else None,
+        swap_items=json.loads(Path(args.swap_data).read_text())["items"] if args.swap_data else None,
+        monitor_items=json.loads(Path(args.monitor_data).read_text())["items"] if args.monitor_data else None,
+        scale=args.scale,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        length_pool=args.length_pool,
+        clean_cache_gb=args.clean_cache_gb,
+        edit_dtype=t.float32 if args.edit_precision == "fp32" else None,
+        relative_lr=args.relative_lr,
+        eval_every=args.eval_every,
+        patience=args.patience,
+        window_sizes=args.window_sizes,
+        all_layers_probability=args.all_layers_probability,
+    )
+    history_path = sibling_path(args.out, "_fit_history.json")
+    write_stage_stamp(
+        args,
+        args.out,
+        fit_history_path=history_path,
+        best_step=fit.best_step,
+        heldout_loss={"init": fit.init_heldout_loss, "best": fit.best_heldout_loss},
+        heldout_hit_rate={"init": fit.init_heldout_hit_rate, "best": fit.best_heldout_hit_rate},
+    )
+    lens.save(args.out, dtype=t.float32)
+    Path(history_path).write_text(json.dumps(fit.history))
+    logger.info("lens saved to %s (history %s)", args.out, history_path)
+    if run is not None:
+        run.summary.update(
+            {
+                "best_step": fit.best_step,
+                "best_heldout_loss": fit.best_heldout_loss,
+                "best_heldout_hit_rate": fit.best_heldout_hit_rate,
+                "lens_path": args.out,
+            }
+        )
+        run.finish()
+
+
 STAGE_HANDLERS = {
     "fit-router": _run_fit_router,
     "fit-shard": _run_fit_shard,
@@ -1167,6 +1954,11 @@ STAGE_HANDLERS = {
     "fit-weights": _run_fit_weights,
     "evaluate": _run_evaluate,
     "probe-swap": _run_probe_swap,
+    "collect-pairs": _run_collect_pairs,
+    "fit-intervention": _run_fit_intervention,
+    "fit-output-kl": _run_fit_output_kl,
+    "build-experts": _run_build_experts,
+    "fit-swap": _run_fit_swap,
 }
 
 

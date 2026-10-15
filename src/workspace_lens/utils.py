@@ -139,6 +139,27 @@ def final_position_model_logits(model: LensModel, prompt: str, max_seq_len: int)
     return model.unembed(final_residual_F.float()[None, :])[0].float().cpu()
 
 
+def ranking_logits(model: LensModel, residual_PF: t.Tensor) -> t.Tensor:
+    """Logits to rank tokens by: the model's final norm and unembedding in fp32, without the
+    final logit soft-cap. The soft-cap (``cap * tanh(x / cap)``, Gemma) is monotone, so it never
+    changes an exact ranking, but ``model.unembed`` applies it in the LM head's dtype (bf16),
+    where every logit far above the cap rounds to the same value: many tokens tie at the top,
+    and a lens whose logits run large would collect ties instead of ranks. Falls back to
+    ``model.unembed`` for models that expose no final norm and LM head. The fp32 unembedding
+    is cached on the model."""
+    final_norm = getattr(model, "_final_norm", None) or getattr(model, "norm", None)
+    lm_head = getattr(model, "_lm_head", None) or getattr(model, "lm_head", None)
+    if final_norm is None or lm_head is None:
+        return model.unembed(residual_PF).float()
+    unembed_VF = getattr(model, "_ranking_unembed_VF", None)
+    if unembed_VF is None:
+        unembed_VF = get_unembed_matrix(model).float()
+        model._ranking_unembed_VF = unembed_VF  # type: ignore[attr-defined]
+    logits_PV = final_norm(residual_PF.float().to(unembed_VF.device)).float() @ unembed_VF.T
+    bias_V = getattr(lm_head, "bias", None)
+    return logits_PV + bias_V.float() if bias_V is not None else logits_PV
+
+
 def masked_lens_logits(
     model: LensModel,
     lens: BaseLens,
@@ -146,10 +167,10 @@ def masked_lens_logits(
     layer: int,
     excluded_mask_Bool_V: t.Tensor | None,
 ) -> t.Tensor:
-    """``unembed(transport(h))`` at every position, fp32 on the residual's
-    device, with the excluded ids (if any) forced to ``-inf`` — the one
-    readout every ranking eval scores."""
-    logits_PV = model.unembed(lens.transport(residual_PN, layer)).float()
+    """The lens's ranking logits (:func:`ranking_logits` of ``transport(h)``: fp32, before the
+    soft-cap, so no ties) at every position, on the unembedding's device, with the excluded
+    ids (if any) forced to ``-inf`` — the one readout every ranking eval scores."""
+    logits_PV = ranking_logits(model, lens.transport(residual_PN, layer))
     if excluded_mask_Bool_V is not None:
         logits_PV = logits_PV.masked_fill(
             excluded_mask_Bool_V.to(logits_PV.device), float("-inf")

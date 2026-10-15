@@ -296,7 +296,7 @@ def test_main_probe_swap_writes_trials_tables_and_stamp(
         for i, item in enumerate(multihop_items)
     ]
 
-    def fake_run_probe_swap(model, lenses, *, layers, scales, max_seq_len):
+    def fake_run_probe_swap(model, lenses, *, layers, scales, max_seq_len, data_path=None):
         rows = [
             {
                 "variant": "main",

@@ -10,8 +10,9 @@ that does the combining.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch as t
@@ -137,6 +138,49 @@ class ExpertJacobians:
             fallback_L_dict_Bool_E=fallback_L_dict_Bool_E,
             config=config,
             min_kept_positions=min_kept_positions,
+        )
+
+    @classmethod
+    def from_lenses(
+        cls, lenses: Sequence[JacobianLens], *, layers: Sequence[int]
+    ) -> ExpertJacobians:
+        """Whole lenses as the experts (expert ``e`` at a layer is lens ``e``'s map
+        there), so fit-weights learns a signed mix of lenses instead of clusters. The
+        lenses must agree on the model, width and target layer and cover ``layers``.
+        There are no fit positions behind these experts: the counts and weight sums are
+        zero, nothing is a fallback, and the pooled map is the experts' mean. The config
+        is the first lens's, with ``num_clusters`` set to the number of lenses."""
+        if not lenses:
+            raise ValueError("need at least one lens")
+        first_config = lenses[0].config
+        for lens in lenses[1:]:
+            for field_name in ("d_model", "hf_model_name", "relative_end_transport_layer"):
+                ours, theirs = getattr(first_config, field_name), getattr(lens.config, field_name)
+                if ours != theirs:
+                    raise ValueError(f"lenses disagree on {field_name}: {ours!r} != {theirs!r}")
+        for lens in lenses:
+            missing = sorted(set(layers) - set(lens.source_layers))
+            if missing:
+                raise ValueError(f"lens {lens.config.checkpoint_name!r} has no map at layers {missing}")
+        experts_L_dict_EFN = {
+            layer: t.stack([lens.jacobians_L_dict_FN[layer].float().cpu() for lens in lenses])  # type: ignore[index]
+            for layer in layers
+        }
+        num_experts = len(lenses)
+        return cls(
+            experts_L_dict_EFN=experts_L_dict_EFN,
+            pooled_jacobian_L_dict_FN={
+                layer: experts_EFN.mean(dim=0) for layer, experts_EFN in experts_L_dict_EFN.items()
+            },
+            position_counts_L_dict_E={layer: t.zeros(num_experts, dtype=t.long) for layer in layers},
+            weight_sums_L_dict_E={layer: t.zeros(num_experts) for layer in layers},
+            fallback_L_dict_Bool_E={layer: t.zeros(num_experts, dtype=t.bool) for layer in layers},
+            config=dataclasses.replace(
+                first_config.as_jacobian(checkpoint_name=first_config.checkpoint_name),
+                source_layers=list(layers),
+                num_clusters=num_experts,
+            ),
+            min_kept_positions=0,
         )
 
     def combine(

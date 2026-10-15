@@ -12,11 +12,16 @@ from workspace_lens.routing.cluster import (
 
 @dataclass
 class LayerActivationRouter:
-    """The frozen clustering for one layer: PCA projection plus centroids."""
+    """The frozen clustering for one layer: PCA projection plus centroids.
+
+    With ``centroid_labels_C`` set, the "centroids" are labelled reference points
+    (e.g. a subsample clustered by ADP) and an activation takes the label of its
+    nearest reference point (1-nearest-neighbour) instead of the centroid's index."""
 
     pca_mean_N: t.Tensor
     pca_components_ND: t.Tensor
     centroids_ED: t.Tensor
+    centroid_labels_C: t.Tensor | None = None
 
     def project(self, residual_BsN: t.Tensor) -> t.Tensor:
         """:func:`normalize_center_project` with this layer's parameters."""
@@ -34,6 +39,8 @@ class LayerActivationRouter:
 
         flat_PD = projected_BsD.reshape(-1, projected_BsD.shape[-1])
         assignments_Int_P = t.cdist(flat_PD, centroids_ED).argmin(dim=1)
+        if self.centroid_labels_C is not None:
+            assignments_Int_P = self.centroid_labels_C.to(residual_BsN.device)[assignments_Int_P]
         return assignments_Int_P.reshape(projected_BsD.shape[:-1])
 
 
@@ -113,6 +120,11 @@ class ActivationRouterCollection:
                     layer: layer_router.centroids_ED.cpu()
                     for layer, layer_router in self.layer_routers_L_dict.items()
                 },
+                "centroid_labels": {
+                    layer: layer_router.centroid_labels_C.cpu()
+                    for layer, layer_router in self.layer_routers_L_dict.items()
+                    if layer_router.centroid_labels_C is not None
+                },
             },
             path,
         )
@@ -131,6 +143,7 @@ class ActivationRouterCollection:
                 pca_mean_N=state["pca_means"][layer],
                 pca_components_ND=state["pca_components"][layer],
                 centroids_ED=state["centroids"][layer],
+                centroid_labels_C=state.get("centroid_labels", {}).get(layer),
             )
             for layer in state["centroids"]
         }

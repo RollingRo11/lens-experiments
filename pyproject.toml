@@ -26,6 +26,9 @@ dev = ["pytest==9.1.1", "ruff==0.16.1"]
 # --extra cpu for CPU-only machines (tests), --extra cu128 for CUDA 12.8 GPUs.
 cpu = ["torch==2.13.0", "accelerate==1.12.0"]
 cu128 = ["torch==2.11.0", "accelerate==1.12.0"]
+tracking = [
+    "wandb>=0.30.0",
+]
 
 [tool.uv]
 conflicts = [[{ extra = "cpu" }, { extra = "cu128" }]]

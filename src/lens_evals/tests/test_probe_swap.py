@@ -71,7 +71,7 @@ def test_run_probe_swap_equals_a_direct_clamp_swap_runner_call(
     ]
     loader_calls: list[bool] = []
 
-    def fake_loader(*, include_controls: bool) -> list[SwapTrial]:
+    def fake_loader(_data_path: str = "", *, include_controls: bool) -> list[SwapTrial]:
         loader_calls.append(include_controls)
         return trials
 

@@ -165,3 +165,26 @@ def test_position_mask_skips_the_first_positions_and_the_last() -> None:
 
     with pytest.raises(ValueError, match="too short"):
         get_position_mask_with_early_skips(3, 2)
+
+
+def test_ranking_logits_break_the_soft_cap_ties() -> None:
+    """Gemma's unembed applies its logit soft-cap in bf16, so logits far above the cap all
+    round to the cap and tie; the ranking logits (fp32, before the cap) keep them apart and
+    order tokens exactly as the uncapped fp32 logits do."""
+    import jlens
+    from workspace_lens.tests.tiny_gemma_olmo import build_tiny_gemma4
+    from workspace_lens.tests.tokenizers import CharTokenizer
+    from workspace_lens.utils import ranking_logits
+
+    hf_model = build_tiny_gemma4().to(torch.bfloat16)
+    model = jlens.from_hf(hf_model, CharTokenizer())
+    model._logit_softcap = 0.01  # far below the tiny model's logits, so the cap saturates
+    residual_PF = 50 * torch.randn(4, model.d_model, generator=torch.Generator().manual_seed(0))
+
+    capped_PV = model.unembed(residual_PF).float()
+    assert int((capped_PV == capped_PV.max(dim=-1, keepdim=True).values).sum(dim=-1).max()) > 1
+
+    exact_PV = ranking_logits(model, residual_PF)
+    expected_PV = model._final_norm(residual_PF.float()).float() @ model._lm_head.weight.float().T
+    torch.testing.assert_close(exact_PV, expected_PV)
+    assert int((exact_PV == exact_PV.max(dim=-1, keepdim=True).values).sum(dim=-1).max()) == 1

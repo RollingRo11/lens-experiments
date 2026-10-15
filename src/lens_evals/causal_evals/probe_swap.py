@@ -183,8 +183,10 @@ def run_probe_swap(
     scales: Sequence[float] = PROBE_SWAP_SCALES,
     max_seq_len: int = 512,
     include_controls: bool = False,
+    data_path: str = PROBE_SWAP_PATH,
 ) -> tuple[pd.DataFrame, list[tuple[str, str, str]]]:
-    """Run the probe-swap trials through :class:`SwapEvalRunner`.
+    """Run the probe-swap trials (from ``data_path``, the probe-swap items by default)
+    through :class:`SwapEvalRunner`.
 
     Every JacobianLens is sliced to ``layers`` (other lenses, e.g. the logit
     lens, are passed as given). The clamp swaps are applied at ``layers`` on
@@ -196,7 +198,7 @@ def run_probe_swap(
     ``(eval, item, concept)`` triples it skipped for having no single-token
     surface.
     """
-    trials = load_probe_swap_trials(include_controls=include_controls)
+    trials = load_probe_swap_trials(data_path, include_controls=include_controls)
     sliced_lenses: dict[str, BaseLens] = {
         name: slice_lens_to_layers(lens, layers) if isinstance(lens, JacobianLens) else lens
         for name, lens in lenses.items()

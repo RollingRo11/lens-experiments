@@ -1,0 +1,40 @@
+diff --git a/src/wsbench/llm.py b/src/wsbench/llm.py
+index aedc6e8..8db1774 100644
+--- a/src/wsbench/llm.py
++++ b/src/wsbench/llm.py
+@@ -21,6 +21,8 @@ from dataclasses import dataclass
+ from typing import Any, Literal
+ 
+ OPENROUTER = "https://openrouter.ai/api/v1"
++# Local judge (jpp_lens patch): an OpenAI-compatible server (vLLM) at this URL replaces OpenRouter.
++LOCAL_BASE_URL = os.environ.get("WSBENCH_BASE_URL", "")
+ _TRANSIENT = (408, 409, 429, 500, 502, 503, 504, 529)
+ _FATAL = ("AuthenticationError", "PermissionDeniedError", "NotFoundError")
+ _ATTEMPTS = 12
+@@ -67,6 +69,8 @@ def api_key(model: str) -> str:
+             raise JudgeConfigError(f"ANTHROPIC_API_KEY is missing (needed for {model})")
+         return key
+     key = os.environ.get("OPENROUTER_API_KEY", "")
++    if LOCAL_BASE_URL:
++        return key or "local"
+     if not key.startswith("sk-or-"):
+         raise JudgeConfigError("OPENROUTER_API_KEY is missing or not an OpenRouter key (sk-or-…)")
+     return key
+@@ -137,7 +141,7 @@ def _make_client(route: str, key: str) -> Any:
+         return AsyncAnthropic(api_key=key, max_retries=0)
+     from openai import AsyncOpenAI
+ 
+-    return AsyncOpenAI(api_key=key, base_url=OPENROUTER, max_retries=0)
++    return AsyncOpenAI(api_key=key, base_url=LOCAL_BASE_URL or OPENROUTER, max_retries=0)
+ 
+ 
+ # ---------------------------------------------------------------- one call
+@@ -172,6 +176,8 @@ async def _openrouter_once(
+     }
+     if reasoning is not None:
+         extra_body["reasoning"] = reasoning
++    if LOCAL_BASE_URL:  # vLLM: no OpenRouter fields; thinking off in the chat template
++        extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+     kwargs: dict[str, Any] = {}
+     if temperature is not None:
+         kwargs["temperature"] = temperature

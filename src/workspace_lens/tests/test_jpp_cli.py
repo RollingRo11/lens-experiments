@@ -124,6 +124,11 @@ STAGES = [
     "fit-weights",
     "evaluate",
     "probe-swap",
+    "collect-pairs",
+    "fit-intervention",
+    "fit-output-kl",
+    "build-experts",
+    "fit-swap",
 ]
 
 # Four labelled items per macro eval; every prompt holds a newline (poetry
