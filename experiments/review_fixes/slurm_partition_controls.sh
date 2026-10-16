@@ -10,7 +10,7 @@
 #SBATCH --gres=gpu:h200:1
 #SBATCH -c 8
 #SBATCH --mem=128G
-#SBATCH -t 06:00:00
+#SBATCH -t 04:30:00
 #SBATCH -J review-partitions
 #SBATCH -o /projects/RohanKathuria/jpp_lens_review/logs/review_partitions_%j.log
 set -euo pipefail

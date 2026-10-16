@@ -11,7 +11,7 @@
 #SBATCH --gres=gpu:h200:1
 #SBATCH -c 8
 #SBATCH --mem=160G
-#SBATCH -t 05:00:00
+#SBATCH -t 04:00:00
 #SBATCH -J review-swap-v4
 #SBATCH -o /projects/RohanKathuria/jpp_lens_review/logs/review_swap_v4_%j.log
 set -euo pipefail
@@ -43,6 +43,11 @@ echo "== swap success per layer set, dev and test relations $(date +%T)"
 $PY experiments/intervention_lens/select_windows.py --rows $R/swapv4_windows.parquet --out $R/swapv4_windows_selected.csv
 $PY experiments/intervention_lens/select_windows.py --rows $R/swapv4_windows.parquet --clean-top1 \
     --out $R/swapv4_windows_selected_clean_top1.csv
+
+echo "== the old 16k-step lens on the old held-out swaps, per item (twin relations split out later) $(date +%T)"
+[ -f $R/swapv3_16000_old_heldout_rows.parquet ] || $PY experiments/intervention_lens/eval_layer_windows.py \
+    --data old_heldout=$I/swap_data_v3/heldout.json --window-sizes 5 --band 8-26 \
+    --lens $I/swapall_v3_16000.pt --out $R/swapv3_16000_old_heldout_rows.parquet 2>&1 | quiet
 
 echo "== probe-swap over the band $(date +%T)"
 [ -f $R/swapall_v4_probe_swap_band.parquet ] || $PY scripts/jpp_cli.py probe-swap --hf-model-name $MODEL \

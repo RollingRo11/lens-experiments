@@ -33,8 +33,9 @@ Results, lens files and plots are not in git; they live on the cluster.
 2. **Choosing a cluster per activation at read time ("routing") is worse than J++'s one fixed
    mix**, and worse than a single averaged Jacobian. This matches what the J++ post reports.
 3. **Fitting the lens map by regression on (edit, effect) pairs did not beat the Jacobian.** The
-   version trained on swap edits read out almost nothing. We found why: those edits never contain
-   the average residual vector, so the map never learns what to do with it.
+   version trained on swap edits read out almost nothing. The likely reason: those edits barely
+   vary along the average residual vector's direction, so the fit pins the map down only weakly
+   there, and every real vector has a large component along it.
 4. **Training the map through the J-lens paper's own swap test worked for swapping, not for
    reading.** On 24 relations it never saw, swapping along the trained lens's directions changed
    Gemma's answer to the right new answer 42% of the time (all layers), against 3% for the J-lens
@@ -61,7 +62,7 @@ The lenses compared in this note:
 | Logit lens | Apply the final norm and unembedding directly to the layer's vector. | nostalgebraist (2020) |
 | Tuned Lens | Learn one map per layer so the readout matches the model's own final output. | Belrose et al. (2023) |
 | J-lens (Jacobian lens) | Multiply the vector by the layer's *Jacobian* first, then unembed. | Gurnee et al. (2026) |
-| R-Lens | The J-lens, but the Jacobian is computed through a Layer-wise Relevance Propagation (LRP) backward pass. | Blank and Bhatia; LRP from Bach et al. (2015) |
+| R-Lens | The J-lens, but the Jacobian is computed through a Layer-wise Relevance Propagation (LRP) backward pass. | Blank, Bhatia and Nanda; LRP from Bach et al. (2015) |
 | J++ Lens | Split the activations into clusters, compute one Jacobian per cluster, and mix them with learned weights. | Ayonrinde and Lindsey (2026) |
 
 Short reminders on the terms in that table:
@@ -112,6 +113,8 @@ Short reminders on the terms in that table:
   its Table 5. It is the reference for Parts 3 and 4.
 - **Questions:** only those Gemma itself answers correctly (graded with the prompt's trailing space
   removed; Gemma reads a trailing space as its own token). Typo and association are always kept.
+  The readout does not remove the space: the lens is read at the prompt's last token, which is
+  that trailing space for 83 of the 93 multihop prompts and 19 of the 107 multilingual prompts.
   20% of each task (about 69 questions in total) is used to fit J++'s weights. The other 80% is
   scored. Scored questions per task: association 82, multihop 12, multilingual 47, poetry 68,
   typo 77. Every lens is scored on the same split.
@@ -272,7 +275,8 @@ Edit types, each collected on the same 1,024 WikiText prompts (32 pairs per prom
   0.25. This is the main idea.
 - **Removal:** δ = −h (zero the vector out).
 - **Tuned-Lens-style:** for comparison, a map fitted to match the model's own next-token
-  distribution (KL divergence), with no edits.
+  distribution (KL divergence), with no edits. Unlike the Tuned Lens, it has no bias term: it is
+  one matrix per layer, like every other map here.
 
 We also tried the J++ weighting step with these maps as the "experts" (one weight per map per
 layer, fitted on the same ~69 questions as J++).
@@ -299,11 +303,16 @@ What we learned:
   layers 4 to 16 (0.06 to 0.57). That is a property of Gemma, not a bug: in fp32, tiny edits match
   the J-lens's prediction to about 1% at layers 16 to 28, but at layers 4 to 12 even a 0.2% edit
   is 35 to 110% off. Early layers are far from straight-line at any edit size we can use.
-- **Swap-only maps failed, and we found why.** A swap edit is a difference of two vectors,
-  h′ − h. The part every vector shares (the average residual vector) cancels out, so the map is
-  never told what to do with it. The trained maps blew the average part up 3 to 10 times relative
-  to the part that varies, so every position read out the same tokens. Subtracting the average
-  before reading lifted swap α = 1 from 2 to 18 (old scoring), while barely moving the J-lenses.
+- **Swap-only maps failed, and the average residual vector is the likely reason.** A swap
+  edit is a difference of two vectors, h′ − h, so the part every vector shares (the average
+  residual vector) cancels out of each edit. That does not leave the map undetermined: the
+  differences still point in every direction, and in principle they fix a linear map completely,
+  including what it does along the average's direction. But they vary only a little along that
+  direction, compared with how large the average is in every real vector, so the fit pins the
+  map down only weakly there, and any error is multiplied by that large component at read time.
+  The trained maps blew the average part up 3 to 10 times relative to the part that varies, so
+  every position read out the same tokens. Subtracting the average before reading lifted swap
+  α = 1 from 2 to 18 (old scoring), while barely moving the J-lenses.
 - **Adding removal edits** (which do contain the average) fixed the collapse, but the result (13)
   only matches the logit lens.
 - **The mix (34)** gets above J++ k-means 8 (32) on the fixed scoring, but its weights are fitted on
@@ -331,9 +340,11 @@ word of the same kind, for example "Bavaria". The training step:
 
 Gemma itself is never changed. Only the lens matrices are trained.
 
-**Data.** We built three datasets, keeping only single-token swap words and facts Gemma already
-gets right, and holding out whole relations (not just pairs) for testing. Words used by probe-swap
-and the readout questions were excluded from training.
+**Data.** We built three datasets, keeping only single-token swap words and facts where Gemma
+ranks the answer among its 10 most likely next words on the clean prompt (`--max-rank 10`, so not
+always its top word); an answer of several words was cut to its first word. Whole relations (not
+just pairs) were held out for testing. Words used by probe-swap and the readout questions were
+excluded from training.
 
 | Version | Training swaps | Relations | Distinct swap words | Held out | Sources |
 |---|---|---|---|---|---|
@@ -394,12 +405,15 @@ Earlier, smaller datasets (7 layers, all swapped together):
 | J++ k-means 8 | 4% | 4% |
 | Logit lens | 0% | 1% |
 
-Each lens is scored at its best swap scale. More distinct swap words helped. On the small set, the
-version started from the J-lens got worse on new relations than the J-lens it started from; with
-the medium set it no longer did. Our reading
-of why (from the maths of the setup, not measured): each swap only moves A along the two swapped
-words' unembedding rows, so a matrix trained on about 200 words only changes along about 200 of its
-1,536 input directions.
+Each lens is scored at its best swap scale, and that scale was picked on these same held-out
+swaps, so these numbers are a little optimistic. More distinct swap words helped. On the small
+set, the version started from the J-lens got worse on new relations than the J-lens it started
+from; with the medium set it no longer did. An earlier version of this note explained that by
+saying a matrix trained on about 200 words only changes along about 200 of its 1,536 input
+directions. That was wrong. With plain gradients, a swap step changes A only along the swapped
+words' unembedding rows on A's *output* side (the side that meets the unembedding), not on its
+input side; and Adam, which rescales every entry on its own, does not even keep that. We have no
+tested explanation.
 
 **Probe-swap** (the J-lens paper's 90 two-hop prompts; only 33 to 35 can be scored on Gemma, because
 the eval drops items Gemma gets wrong to begin with and items whose words are not single tokens):
@@ -513,6 +527,10 @@ Code in this repository:
 | Part 2 scripts and SLURM jobs | `experiments/adp_router/`, `experiments/routed_lens/` |
 | Parts 3 and 4 scripts, dataset builders and SLURM jobs | `experiments/intervention_lens/` |
 | Part 5 scripts and SLURM jobs | `experiments/workspace_bench/` |
+| The review fixes: weight refits, random-partition control, swap data v4, WorkspaceBench rescore (jobs) | `experiments/review_fixes/` |
+| Paired bootstrap over questions | `experiments/review_fixes/paired_bootstrap.py` |
+| Canonical relation IDs for the swap data; windows chosen on dev | `experiments/intervention_lens/relation_ids.py`, `select_windows.py` |
+| Random equal-size partitions; partitions keyed by name | `random_position_partition`, `PositionPartitionRouter` in `src/workspace_lens/routing/router.py`; `partition_name` in `src/workspace_lens/fitting/utils.py` |
 
 Tests: `uv run pytest -q` (291 pass on CPU).
 
@@ -529,7 +547,7 @@ curves are in the W&B project [lens-training](https://wandb.ai/rohan-kathuria-ne
 | J++ (k-means 8) | `jpp_lens.pt`, `jpp_lens_v2` | J++ Lens (Ayonrinde and Lindsey) |
 | Number of clusters | `num_clusters`, `K` | experts per layer, E (J++ post) |
 | Weight fitting | `fit-weights`, `ExpertWeighting` | Jacobian Filtering (J++ post) |
-| R-Lens | `pooled_lens` | Pooled Jacobian with LRP (J++ post); R-Lens (Blank and Bhatia) |
+| R-Lens | `pooled_lens` | Pooled Jacobian with LRP (J++ post); R-Lens (Blank, Bhatia and Nanda) |
 | Plain J-lens | `plain_jlens64` | J-lens (Gurnee et al.) |
 | Routing per activation | `routed_*` | k-means routing (J++ post) |
 | Recall@10 | `pass_at_k` | recall@k (J++ post); pass@k (J-lens repo) |
@@ -547,7 +565,7 @@ curves are in the W&B project [lens-training](https://wandb.ai/rohan-kathuria-ne
   layer-wise relevance propagation. PLOS ONE.
 - Belrose et al. (2023). Eliciting latent predictions from transformers with the tuned lens.
   https://arxiv.org/abs/2303.08112
-- Blank and Bhatia. R-Lens (relevance propagation Jacobian lens).
+- Blank, Bhatia and Nanda. R-Lens (relevance propagation Jacobian lens).
   https://huggingface.co/camilablank/workspace-lenses
 - Campello, Moulavi and Sander (2013). Density-based clustering based on hierarchical density
   estimates (HDBSCAN). McInnes, Healy and Astels (2017). hdbscan: hierarchical density based
