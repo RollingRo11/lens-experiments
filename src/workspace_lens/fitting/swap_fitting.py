@@ -796,6 +796,59 @@ def layer_windows(layers: Sequence[int], sizes: Sequence[int]) -> dict[str, list
 
 
 @t.no_grad()
+def swap_hits_by_layer_set(
+    model: LensModel,
+    prompts: Sequence[str],
+    examples: Sequence[SwapExample],
+    maps_L_dict_FN: dict[int, t.Tensor],
+    layer_sets: dict[str, Sequence[int]],
+    *,
+    excluded_mask_Bool_V: t.Tensor | None = None,
+    scale: float = 1.0,
+    max_seq_len: int = 128,
+    batch_size: int = 128,
+) -> dict[str, tuple[float, t.Tensor]]:
+    """Supervised swap loss and per-example top-1 hits of ``examples`` with the swap made at
+    each layer set (the probe-swap edit restricted to those layers): ``{name: (loss,
+    hits_Bool_N)}``, the hits in the order of ``examples``. An empty layer set makes no edit:
+    its hits are the examples whose swapped-in answer the model already gives. Works for any
+    per-layer maps (a fitted lens's Jacobians, or identities for the Logit lens). The clean
+    pass is run once for all layer sets (:class:`CleanResidualCache`) and the rows are batched
+    by prompt length."""
+    device = model_device_of(model)
+    maps_on_device = {layer: matrix_FN.to(device).float() for layer, matrix_FN in maps_L_dict_FN.items()}
+    ids_cache: dict[int, t.Tensor] = {}
+    clean_cache = CleanResidualCache(
+        model, prompts, [example.prompt_idx for example in examples], layers=list(maps_on_device),
+        max_seq_len=max_seq_len, ids_cache=ids_cache,
+    )
+    swap_loss = SwapLoss(
+        model, layers=list(maps_on_device), mode="supervised", scale=scale, window=1,
+        excluded_mask_Bool_V=excluded_mask_Bool_V, clean_cache=clean_cache,
+    )
+    order = sorted(range(len(examples)), key=lambda idx: len(ids_cache[examples[idx].prompt_idx]))
+    batches = [
+        SwapBatch.build(
+            model, prompts, [examples[idx] for idx in order[start : start + batch_size]],
+            max_seq_len=max_seq_len, ids_cache=ids_cache,
+        )
+        for start in range(0, len(order), batch_size)
+    ]
+    order_Int_N = t.tensor(order, dtype=t.long)
+    results: dict[str, tuple[float, t.Tensor]] = {}
+    for name, layers in layer_sets.items():
+        total_loss, hit_chunks = 0.0, []
+        for batch in batches:
+            loss, hits_B = swap_loss(maps_on_device, batch, active_layers=layers)
+            total_loss += float(loss) * len(hits_B)
+            hit_chunks.append(hits_B.cpu())
+        hits_Bool_N = t.zeros(len(examples), dtype=t.bool)
+        hits_Bool_N[order_Int_N] = t.cat(hit_chunks)
+        results[name] = (total_loss / len(examples), hits_Bool_N)
+    return results
+
+
+@t.no_grad()
 def swap_success_by_layer_set(
     model: LensModel,
     prompts: Sequence[str],
@@ -808,35 +861,12 @@ def swap_success_by_layer_set(
     max_seq_len: int = 128,
     batch_size: int = 128,
 ) -> dict[str, tuple[float, float]]:
-    """Supervised swap loss and top-1 hit rate of ``examples`` with the swap made at each
-    layer set (the probe-swap edit restricted to those layers): ``{name: (loss, hit rate)}``.
-    Works for any per-layer maps (a fitted lens's Jacobians, or identities for the Logit
-    lens). The clean pass is run once for all layer sets (:class:`CleanResidualCache`) and the
-    rows are batched by prompt length."""
-    device = model_device_of(model)
-    maps_on_device = {layer: matrix_FN.to(device).float() for layer, matrix_FN in maps_L_dict_FN.items()}
-    ids_cache: dict[int, t.Tensor] = {}
-    clean_cache = CleanResidualCache(
-        model, prompts, [example.prompt_idx for example in examples], layers=list(maps_on_device),
-        max_seq_len=max_seq_len, ids_cache=ids_cache,
-    )
-    swap_loss = SwapLoss(
-        model, layers=list(maps_on_device), mode="supervised", scale=scale, window=1,
-        excluded_mask_Bool_V=excluded_mask_Bool_V, clean_cache=clean_cache,
-    )
-    ordered = sorted(examples, key=lambda example: len(ids_cache[example.prompt_idx]))
-    batches = [
-        SwapBatch.build(model, prompts, ordered[start : start + batch_size], max_seq_len=max_seq_len, ids_cache=ids_cache)
-        for start in range(0, len(ordered), batch_size)
-    ]
-    results: dict[str, tuple[float, float]] = {}
-    with t.no_grad():
-        for name, layers in layer_sets.items():
-            total_loss, hits, rows = 0.0, 0, 0
-            for batch in batches:
-                loss, hits_B = swap_loss(maps_on_device, batch, active_layers=layers)
-                total_loss += float(loss) * len(hits_B)
-                hits += int(hits_B.sum())
-                rows += len(hits_B)
-            results[name] = (total_loss / rows, hits / rows)
-    return results
+    """:func:`swap_hits_by_layer_set` summarised: ``{name: (loss, hit rate)}``."""
+    return {
+        name: (loss, float(hits_Bool_N.float().mean()))
+        for name, (loss, hits_Bool_N) in swap_hits_by_layer_set(
+            model, prompts, examples, maps_L_dict_FN, layer_sets,
+            excluded_mask_Bool_V=excluded_mask_Bool_V, scale=scale, max_seq_len=max_seq_len,
+            batch_size=batch_size,
+        ).items()
+    }

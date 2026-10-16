@@ -44,7 +44,6 @@ from workspace_lens.fitting.condense_experts.rank_objective import (
     build_pair_table,
     combined_logits,
     exact_macro_pass,
-    expert_logits,
     expert_pair_pass_scores,
     hit_margins,
 )
@@ -308,7 +307,7 @@ def test_fit_subset_starts_and_steps_zero(
     excluded_Bool_V[FAKE_EXCLUDED_TOKEN_IDS] = True
     for layer, scores_E in zip(CONDENSE_LAYERS, recorded_scores, strict=True):
         transports_PEF = all_item_expert_transports(model, experts, residuals, layer)[subset_indices]
-        logits_PEV = expert_logits(model.unembed, transports_PEF)
+        logits_PEV = condense_fitter.model_expert_logits(model, transports_PEF)
         expected_scores_E = expert_pair_pass_scores(
             logits_PEV, pairs, excluded_mask_Bool_V=excluded_Bool_V, k=config.pass_k
         )
@@ -371,7 +370,7 @@ def test_single_expert_pass_scores_match_the_stand_alone_scores(tmp_path: Path) 
                 item_indices
             ]
             expected_E = expert_pair_pass_scores(
-                expert_logits(model.unembed, transports_PEF),
+                condense_fitter.model_expert_logits(model, transports_PEF),
                 pairs,
                 excluded_mask_Bool_V=excluded_Bool_V,
                 k=3,

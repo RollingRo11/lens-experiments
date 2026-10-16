@@ -432,7 +432,7 @@ def test_fit_shard_with_two_routers_writes_one_checkpoint_per_k_bit_for_bit(
 def test_fit_shard_rejects_routers_with_the_same_k(
     model: TinyDecoder, router: ActivationRouterCollection, tmp_path: Path
 ) -> None:
-    with pytest.raises(ValueError, match="distinct num_clusters"):
+    with pytest.raises(ValueError, match="distinct names"):
         fit_shard(
             model,
             PROMPTS,
@@ -1305,3 +1305,32 @@ def test_load_fit_prompts_from_json_takes_the_prefix_and_checks_the_count(tmp_pa
     assert jpp_cli.load_fit_prompts_from_json(str(pool_path), 2) == ["p0", "p1"]
     with pytest.raises(ValueError, match="3 prompts; 4 requested"):
         jpp_cli.load_fit_prompts_from_json(str(pool_path), 4)
+
+
+def test_named_router_paths_fit_and_merge_by_partition(
+    model: TinyDecoder, router: ActivationRouterCollection, tmp_path: Path
+) -> None:
+    """``--router-path name=path`` keys a partition by name, so the same router twice under
+    two names is one fit with two checkpoints, and ``merge_experts`` merges each by name to
+    the same experts."""
+    router_path = tmp_path / "router.pt"
+    router.save(str(router_path))
+    partitions = jpp_cli.load_partitions([f"first={router_path}", f"second={router_path}", str(router_path)])
+    assert sorted(partitions, key=str) == [NUM_CLUSTERS, "first", "second"]
+    with pytest.raises(ValueError, match="share the partition"):
+        jpp_cli.load_partitions([f"first={router_path}", f"first={router_path}"])
+    checkpoint_dir = fit_shard(
+        model,
+        PROMPTS,
+        routers=partitions,
+        shard_idx=0,
+        num_shards=1,
+        config=make_tiny_lens_config(tmp_path, "named"),
+    )
+    merged = {
+        name: merge_experts([checkpoint_dir], num_clusters=name, checkpoint_name=f"merged-{name}", device="cpu")
+        for name in ("first", "second", NUM_CLUSTERS)
+    }
+    for layer in LAYERS:
+        assert t.equal(merged["first"].experts_L_dict_EFN[layer], merged["second"].experts_L_dict_EFN[layer])
+        assert t.equal(merged["first"].experts_L_dict_EFN[layer], merged[NUM_CLUSTERS].experts_L_dict_EFN[layer])

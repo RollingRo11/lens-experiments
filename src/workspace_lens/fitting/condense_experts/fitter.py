@@ -54,6 +54,8 @@ from workspace_lens.fitting.condense_experts.rank_objective import (
 from workspace_lens.utils import (
     check_model_matches_config,
     ensure_parent_dir,
+    final_norm_eps,
+    ranking_logits,
     token_id_mask_Bool_V,
     vocab_size_of,
 )
@@ -62,6 +64,23 @@ if TYPE_CHECKING:
     from lens_evals.readout_evals.readout_evals import ReadoutResiduals
 
 logger = logging.getLogger(__name__)
+
+
+### THE CACHED LOGITS
+
+
+def model_expert_logits(model: LensModel, transports_PEF: t.Tensor) -> t.Tensor:
+    """:func:`~workspace_lens.fitting.condense_experts.rank_objective.expert_logits` through
+    ``model``'s ranking logits: its final norm and LM head in fp32, before any logit soft-cap
+    (:func:`~workspace_lens.utils.ranking_logits`), with the norm's own ``eps`` in the rms
+    factor. ``model.unembed`` would be wrong here: Gemma's unembed applies
+    ``30 * tanh(x / 30)`` in bf16, which the rms factor cannot undo and which flattens every
+    large logit to the same value."""
+    return expert_logits(
+        lambda residual_BN: ranking_logits(model, residual_BN),
+        transports_PEF,
+        norm_eps=final_norm_eps(model),
+    )
 
 
 ### THE SEARCH
@@ -394,11 +413,12 @@ class ExpertWeightingFitter:
         pass_k: int,
     ) -> tuple[t.Tensor, t.Tensor]:
         """One layer's ``[P, E, V]`` expert logits (the one pass through the
-        model's unembed) and each expert's stand-alone pair-level macro
-        pass@``pass_k`` on the fitting pairs, ``[E]``. The caller frees the
-        logits before the next layer."""
+        model's fp32, uncapped ranking logits, :func:`model_expert_logits`) and
+        each expert's stand-alone pair-level macro pass@``pass_k`` on the
+        fitting pairs, ``[E]``. The caller frees the logits before the next
+        layer."""
         transports_PEF = self._expert_transports_PEF(layer, fitting_item_indices_Int_P)
-        logits_PEV = expert_logits(self.model.unembed, transports_PEF)
+        logits_PEV = model_expert_logits(self.model, transports_PEF)
         del transports_PEF
         scores_E = expert_pair_pass_scores(
             logits_PEV, pairs, excluded_mask_Bool_V=self.excluded_mask_Bool_V, k=pass_k
@@ -443,7 +463,8 @@ class ExpertWeightingFitter:
         per-layer surrogate for the eval's min rank over layers (module
         docstring). Per layer: :meth:`_expert_transports_PEF` →
         :func:`~workspace_lens.fitting.condense_experts.rank_objective.expert_logits`
-        (the one pass through the model's unembed) →
+        (:func:`model_expert_logits`: the one pass through the model's fp32,
+        uncapped ranking logits) →
         :func:`~workspace_lens.fitting.condense_experts.rank_objective.expert_pair_pass_scores`
         → :func:`build_search_starting_points` (the best expert alone and the
         ``condense_config.top_n`` highest; ties → the lower index) →

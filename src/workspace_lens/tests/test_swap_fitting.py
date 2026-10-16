@@ -346,3 +346,46 @@ def test_swap_edit_in_bf16_is_close_to_fp32() -> None:
     )
     assert edited_bf16.dtype == t.bfloat16
     t.testing.assert_close(edited_bf16.float(), edited_fp32, atol=0.05, rtol=0.02)
+
+
+def test_per_example_hits_keep_the_example_order(model: HFLensModel, excluded_mask_Bool_V: t.Tensor) -> None:
+    """``swap_hits_by_layer_set`` returns each example's hit in the order of the examples
+    (rows are batched by prompt length internally): scoring every example alone gives the
+    same hits, the summary is their mean, and the empty layer set makes no edit, so its hits
+    are the examples whose answer the unedited model already gives."""
+    from workspace_lens.fitting.swap_fitting import (
+        swap_hits_by_layer_set,
+        swap_success_by_layer_set,
+    )
+
+    prompts, examples, kept = jpp_cli.swap_examples_and_kept_items(model, SWAP_ITEMS, max_seq_len=MAX_SEQ_LEN)
+    assert len(kept) == len(examples)
+    generator = t.Generator().manual_seed(3)
+    maps_L_dict_FN = {
+        layer: t.eye(TINY_D_MODEL) + 0.3 * t.randn(TINY_D_MODEL, TINY_D_MODEL, generator=generator) for layer in LAYERS
+    }
+    layer_sets = {"L0": [0], "all": LAYERS, "none": []}
+    together = swap_hits_by_layer_set(
+        model, prompts, examples, maps_L_dict_FN, layer_sets,
+        excluded_mask_Bool_V=excluded_mask_Bool_V, max_seq_len=MAX_SEQ_LEN, batch_size=3,
+    )
+    for idx, example in enumerate(examples):
+        alone = swap_hits_by_layer_set(
+            model, prompts, [example], maps_L_dict_FN, layer_sets,
+            excluded_mask_Bool_V=excluded_mask_Bool_V, max_seq_len=MAX_SEQ_LEN,
+        )
+        for name in layer_sets:
+            assert bool(alone[name][1][0]) == bool(together[name][1][idx]), (idx, name)
+    summary = swap_success_by_layer_set(
+        model, prompts, examples, maps_L_dict_FN, layer_sets,
+        excluded_mask_Bool_V=excluded_mask_Bool_V, max_seq_len=MAX_SEQ_LEN,
+    )
+    for name in layer_sets:
+        assert summary[name][1] == pytest.approx(float(together[name][1].float().mean()))
+    # No edit: the hits do not depend on the maps.
+    zero_maps = {layer: t.zeros(TINY_D_MODEL, TINY_D_MODEL) for layer in LAYERS}
+    unedited = swap_hits_by_layer_set(
+        model, prompts, examples, zero_maps, {"none": []},
+        excluded_mask_Bool_V=excluded_mask_Bool_V, max_seq_len=MAX_SEQ_LEN,
+    )
+    assert t.equal(unedited["none"][1], together["none"][1])

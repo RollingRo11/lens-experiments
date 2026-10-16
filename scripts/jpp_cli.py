@@ -130,13 +130,18 @@ from workspace_lens.fitting.swap_fitting import (
 from workspace_lens.fitting.utils import (
     expert_checkpoint_filename,
     merge_expert_checkpoints,
+    partition_name,
 )
 from workspace_lens.lenses.base_lens import BaseLens
 from workspace_lens.lenses.jacobian_lens import JacobianLens
 from workspace_lens.lenses.logit_lens import LogitLens
 from workspace_lens.lrp import LRP_MODES
 from workspace_lens.routing.cluster import collect_valid_position_activations
-from workspace_lens.routing.router import ActivationRouterCollection
+from workspace_lens.routing.router import (
+    ActivationRouterCollection,
+    PositionPartitionRouter,
+    load_router,
+)
 from workspace_lens.utils import (
     check_model_matches_config,
     ensure_parent_dir,
@@ -271,13 +276,40 @@ def fit_router(
     return router
 
 
-def check_distinct_router_ks(routers: Sequence[ActivationRouterCollection]) -> None:
-    """Two routers with the same K would write the same ``experts_K<K>_checkpoint.pt``;
-    checked before the model is loaded so a bad command line fails in seconds."""
-    ks = [router.num_clusters for router in routers]
-    if len(set(ks)) != len(ks):
+def parse_router_spec(spec: str) -> tuple[str | None, str]:
+    """``--router-path`` entry ``[name=]path``: the partition name (None: key the partition
+    by its router's K) and the router file."""
+    name, separator, path = spec.partition("=")
+    return (name, path) if separator else (None, spec)
+
+
+def load_partitions(specs: Sequence[str]) -> dict[int | str, ActivationRouterCollection | PositionPartitionRouter]:
+    """The routers of ``--router-path`` keyed as the trainer keys partitions: by name where the
+    entry names one, else by the router's K (:func:`parse_router_spec`, :func:`load_router`);
+    duplicate names are an error (:func:`check_distinct_router_ks`)."""
+    partitions: dict[int | str, ActivationRouterCollection | PositionPartitionRouter] = {}
+    for spec in specs:
+        name, path = parse_router_spec(spec)
+        router = load_router(path)
+        key: int | str = router.num_clusters if name is None else name
+        if key in partitions:
+            raise ValueError(f"two --router-path entries share the partition {key!r}")
+        partitions[key] = router
+    check_distinct_router_ks(list(partitions))
+    return partitions
+
+
+def check_distinct_router_ks(partitions: Sequence[int | str | ActivationRouterCollection]) -> None:
+    """Two partitions with the same name (a router keyed by K is named ``K<K>``) would write the
+    same checkpoint file; checked before the model is loaded so a bad command line fails in
+    seconds. Takes partition keys, or routers (keyed by their K)."""
+    names = [
+        partition_name(item if isinstance(item, (int, str)) else item.num_clusters) for item in partitions
+    ]
+    if len(set(names)) != len(names):
         raise ValueError(
-            f"routers must have distinct num_clusters (one checkpoint per K), got {ks}"
+            f"partitions must have distinct names (one checkpoint each), got {names}; "
+            "give routers with the same K a name with --router-path name=path"
         )
 
 
@@ -285,7 +317,7 @@ def fit_shard(
     model: LensModel,
     prompts: Sequence[str],
     *,
-    routers: Sequence[ActivationRouterCollection],
+    routers: Sequence[ActivationRouterCollection] | dict[int | str, ActivationRouterCollection | PositionPartitionRouter],
     shard_idx: int,
     num_shards: int,
     config: LensConfig,
@@ -294,13 +326,15 @@ def fit_shard(
     ``prompts``, :func:`shard_prompt_slice`) and return its checkpoint
     directory, ``<artifacts>/<date>/<config.checkpoint_name>/shard<i>of<n>/``.
 
-    ``routers`` are the frozen per-layer :class:`ActivationRouterCollection`
-    routers the shard buckets under, one per distinct K. Every router sees the same forward and
+    ``routers`` are the frozen per-layer routers the shard buckets under: a list (each keyed
+    by its K, so the Ks must be distinct) or a dict from partition key (K or name,
+    :func:`load_partitions`) to router. Every router sees the same forward and
     backward passes (the trainer only changes the reduction over positions), so
-    the passes are shared; only the per-K reduction, the CPU accumulation and the
+    the passes are shared; only the per-partition reduction, the CPU accumulation and the
     accumulators' CPU RAM scale with the sum of the Ks. The shard directory then
-    holds one ``experts_K<K>_checkpoint.pt`` per router.
-    Two routers with the same K would write the same file, so that is an error.
+    holds one ``experts_<name>_checkpoint.pt`` per partition (``experts_K<K>_checkpoint.pt``
+    for one keyed by K). Two partitions with the same name would write the same file, so
+    that is an error.
 
     The shard's config is ``config`` with the shard's ``checkpoint_name``; the
     trainer itself stamps the router geometry (K, projection dim) and the resolved
@@ -314,8 +348,12 @@ def fit_shard(
     """
     if not 0 <= shard_idx < num_shards:
         raise ValueError(f"shard_idx must be in [0, {num_shards}), got {shard_idx}")
-    check_distinct_router_ks(routers)
-    router_collections_K_dict = {router.num_clusters: router for router in routers}
+    if isinstance(routers, dict):
+        router_collections_K_dict = dict(routers)
+    else:
+        check_distinct_router_ks(list(routers))
+        router_collections_K_dict = {router.num_clusters: router for router in routers}
+    check_distinct_router_ks(list(router_collections_K_dict))
     prompt_slice = shard_prompt_slice(len(prompts), num_shards, shard_idx)
     shard_prompts = list(prompts[prompt_slice])
 
@@ -330,14 +368,14 @@ def fit_shard(
         router_collections_K_dict=router_collections_K_dict,
     )
     logger.info(
-        "%s shard %d/%d: prompts [%d, %d) of %d, K=%s, checkpoints in %s",
+        "%s shard %d/%d: prompts [%d, %d) of %d, partitions %s, checkpoints in %s",
         trainer_class.__name__,
         shard_idx,
         num_shards,
         prompt_slice.start,
         prompt_slice.stop,
         len(prompts),
-        sorted(router_collections_K_dict),
+        {partition_name(key): router.num_clusters for key, router in router_collections_K_dict.items()},
         trainer.config.checkpoint_path,
     )
     trainer.fit()
@@ -347,12 +385,13 @@ def fit_shard(
 def merge_experts(
     checkpoint_dirs: Sequence[str],
     *,
-    num_clusters: int,
+    num_clusters: int | str,
     min_kept_positions: int = RECIPE_MIN_KEPT_POSITIONS,
     checkpoint_name: str,
     device: str = DEFAULT_MERGE_DEVICE,
 ) -> ExpertJacobians:
-    """Stage 3: sum the shards' sufficient statistics for one K (exact: every
+    """Stage 3: sum the shards' sufficient statistics for one partition, ``num_clusters``
+    (its K, or its name for a named partition; exact: every
     accumulator is a plain sum over disjoint prompt sets), then the per-expert
     means (:meth:`ExpertJacobians.from_sums`), with experts that kept fewer than
     ``min_kept_positions`` positions replaced by the layer's pooled Jacobian.
@@ -386,6 +425,7 @@ def fit_weights(
     max_seq_len: int = RECIPE_READOUT_MAX_SEQ_LEN,
     fitting_item_names: Sequence[str] | None = None,
     condense_config: CondenseConfig = DEFAULT_CONDENSE_CONFIG,
+    collapse_fallbacks: bool = True,
 ) -> tuple[ExpertWeighting, JacobianLens]:
     """Stage 4: :meth:`ReadoutEvalRunner.record_residuals` for ``items`` (loaded from
     ``cache_path`` when it exists; items with no single-token candidate are
@@ -398,12 +438,22 @@ def fit_weights(
     ``hf_model_name`` keys the residuals cache; required for models without
     an HF name (test models). ``layers`` must be among the experts' layers,
     checked up front so a wrong layer set fails before the recording pass (the
-    stage's expensive step) rather than after it."""
+    stage's expensive step) rather than after it. With ``collapse_fallbacks``
+    (the default) every layer's copies of the pooled Jacobian are merged into one
+    slot first (:meth:`ExpertJacobians.collapse_fallbacks`); the per-layer cluster
+    counts and fallback share are logged either way."""
     unknown_layers = sorted(set(layers) - set(expert_jacobians.layers))
     if unknown_layers:
         raise ValueError(
             f"layers {unknown_layers} are not among the experts' layers "
             f"{expert_jacobians.layers}"
+        )
+    log_expert_summary(expert_jacobians, layers)
+    if collapse_fallbacks:
+        expert_jacobians = expert_jacobians.collapse_fallbacks()
+        logger.info(
+            "fallback copies collapsed: expert slots per layer %s",
+            {layer: expert_jacobians.experts_L_dict_EFN[layer].shape[0] for layer in layers},
         )
     runner = readout_runner(model, layers=layers, max_seq_len=max_seq_len)
     residuals = runner.record_residuals(
@@ -417,6 +467,26 @@ def fit_weights(
     )
     lens = expert_jacobians.combine(weighting.weights_L_dict_E, checkpoint_name=checkpoint_name)
     return weighting, lens
+
+
+def log_expert_summary(expert_jacobians: ExpertJacobians, layers: Sequence[int]) -> None:
+    """Log, per layer, the expert slots, the populated clusters, those with their own
+    Jacobian, the fallback slots and the share of fit positions in fallback clusters
+    (:meth:`ExpertJacobians.layer_summary`), then the slot counts."""
+    summary = expert_jacobians.layer_summary()
+    for layer in layers:
+        row = summary[layer]
+        logger.info(
+            "layer %d: %d slots, %d populated clusters, %d with their own Jacobian, %d fallback "
+            "slots holding %.1f%% of fit positions; counts %s",
+            layer,
+            row["slots"],
+            row["populated"],
+            row["own_jacobian"],
+            row["fallback_slots"],
+            100 * float(row["fallback_position_fraction"]),
+            row["counts"],
+        )
 
 
 def evaluate(
@@ -680,11 +750,21 @@ def swap_examples_from_items(
     format: X and Y resolved to their swap tokens as probe-swap does
     (:func:`resolve_swap_token`), the answer ids every single-token surface of Y's answer
     (``swap_answer_surfaces`` when given, else ``swap_answer``), read at the last position.
-    Items with no swap token or answer token are dropped (logged)."""
+    Items with no swap token or answer token are dropped (logged;
+    :func:`swap_examples_and_kept_items` also says which)."""
+    prompts, examples, _ = swap_examples_and_kept_items(model, items, max_seq_len=max_seq_len)
+    return prompts, examples
+
+
+def swap_examples_and_kept_items(
+    model: LensModel, items: Sequence[dict], *, max_seq_len: int
+) -> tuple[list[str], list[SwapExample], list[int]]:
+    """:func:`swap_examples_from_items` plus, per example, the index of its item."""
     prompts = sorted({item["prompt"] for item in items})
     prompt_index = {prompt: idx for idx, prompt in enumerate(prompts)}
     examples: list[SwapExample] = []
-    for item in items:
+    kept_item_indices: list[int] = []
+    for item_idx, item in enumerate(items):
         source_id, _ = resolve_swap_token(model.tokenizer, item["intermediate"])
         target_id, _ = resolve_swap_token(model.tokenizer, item["swap_to"])
         answers = item.get("swap_answer_surfaces") or [item["swap_answer"]]
@@ -698,7 +778,8 @@ def swap_examples_from_items(
         examples.append(
             SwapExample(prompt_index[item["prompt"]], position, source_id, target_id, tuple(answer_ids))
         )
-    return prompts, examples
+        kept_item_indices.append(item_idx)
+    return prompts, examples, kept_item_indices
 
 
 def fit_swap(
@@ -1065,8 +1146,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--router-path",
         nargs="+",
         required=True,
-        help="Router .pt file(s) from fit-router, space-separated. Several files with "
-        "distinct K bucket the same backward passes into one checkpoint per K.",
+        help="Router .pt file(s), space-separated, each as path or name=path. Several "
+        "routers bucket the same backward passes into one checkpoint each: a router given "
+        "without a name is keyed by its K (experts_K<K>_checkpoint.pt), a named one by its "
+        "name (experts_<name>_checkpoint.pt), so routers with the same K need names.",
     )
     fit_shard_parser.add_argument("--shard-idx", type=int, default=0)
     fit_shard_parser.add_argument("--num-shards", type=int, default=1)
@@ -1118,6 +1201,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint-dirs", nargs="+", required=True, help="Shard directories."
     )
     merge_parser.add_argument("--num-clusters", type=int, default=RECIPE_NUM_CLUSTERS)
+    merge_parser.add_argument(
+        "--partition",
+        default=None,
+        help="Merge the named partition (experts_<name>_checkpoint.pt) instead of the one "
+        "keyed by --num-clusters.",
+    )
     merge_parser.add_argument(
         "--min-kept-positions",
         type=int,
@@ -1190,6 +1279,12 @@ def build_parser() -> argparse.ArgumentParser:
     fit_weights_parser.add_argument("--k", type=int, default=DEFAULT_CONDENSE_CONFIG.pass_k)
     fit_weights_parser.add_argument("--top-n", type=int, default=DEFAULT_CONDENSE_CONFIG.top_n)
     fit_weights_parser.add_argument("--steps", type=int, default=DEFAULT_CONDENSE_CONFIG.steps)
+    fit_weights_parser.add_argument(
+        "--keep-fallback-copies",
+        action="store_true",
+        help="Search over every expert slot as stored. Default: each layer's copies of the "
+        "pooled Jacobian (experts with too few positions) are merged into one slot first.",
+    )
     fit_weights_parser.add_argument(
         "--out",
         required=True,
@@ -1476,8 +1571,7 @@ def _run_fit_router(args: argparse.Namespace) -> None:
 
 
 def _run_fit_shard(args: argparse.Namespace) -> None:
-    routers = [ActivationRouterCollection.load(path) for path in args.router_path]
-    check_distinct_router_ks(routers)
+    routers = load_partitions(args.router_path)
     config = LensConfig(
         hf_model_name=args.hf_model_name,
         checkpoint_name=args.checkpoint_name,
@@ -1519,7 +1613,7 @@ def _run_fit_shard(args: argparse.Namespace) -> None:
 def _run_merge_experts(args: argparse.Namespace) -> None:
     expert_jacobians = merge_experts(
         args.checkpoint_dirs,
-        num_clusters=args.num_clusters,
+        num_clusters=args.partition if args.partition is not None else args.num_clusters,
         min_kept_positions=args.min_kept_positions,
         checkpoint_name=args.checkpoint_name,
         device=args.device,
@@ -1676,12 +1770,17 @@ def _run_fit_weights(args: argparse.Namespace) -> None:
         max_seq_len=args.readout_max_seq_len,
         fitting_item_names=[item.name for item in fitting_items],
         condense_config=CondenseConfig(pass_k=args.k, top_n=args.top_n, steps=args.steps),
+        collapse_fallbacks=not args.keep_fallback_copies,
     )
     weights_path = sibling_path(args.out, "_expert_weights.json")
     write_stage_stamp(
         args,
         args.out,
         expert_weights_path=weights_path,
+        experts_by_layer={
+            str(layer): {key: value for key, value in row.items() if key != "counts"}
+            for layer, row in expert_jacobians.layer_summary().items()
+        },
         num_excluded_token_ids=len(excluded_token_ids),
         fitting_item_names=[item.name for item in fitting_items],
         train_macro_pass={

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from dataclasses import dataclass
 
 import torch as t
@@ -190,10 +191,26 @@ def build_layer_expert_jacobians(
     return experts_EFN, pooled_jacobian_FN, fallback_Bool_E
 
 
-def expert_checkpoint_filename(num_clusters: int) -> str:
-    """The per-K checkpoint file written by :meth:`ExpertJacobianTrainer.
-    write_checkpoint`."""
-    return f"experts_K{num_clusters}_checkpoint.pt"
+_PARTITION_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def partition_name(partition: int | str) -> str:
+    """The name of one partition (one bucketing of the fit positions) of an expert fit: a
+    partition keyed by its cluster count ``K`` (an int, the original keying) is named ``K<K>``;
+    a string key is its own name, so two partitions with the same K can share a fit pass."""
+    if isinstance(partition, bool) or not isinstance(partition, (int, str)):
+        raise TypeError(f"a partition key is an int K or a name, got {partition!r}")
+    name = f"K{partition}" if isinstance(partition, int) else partition
+    if not _PARTITION_NAME_PATTERN.fullmatch(name):
+        raise ValueError(f"partition name {name!r} must match {_PARTITION_NAME_PATTERN.pattern}")
+    return name
+
+
+def expert_checkpoint_filename(partition: int | str) -> str:
+    """The per-partition checkpoint file written by :meth:`ExpertJacobianTrainer.
+    write_checkpoint`: ``experts_<name>_checkpoint.pt`` (:func:`partition_name`), so a
+    partition keyed by K keeps the original ``experts_K<K>_checkpoint.pt``."""
+    return f"experts_{partition_name(partition)}_checkpoint.pt"
 
 
 def source_gradients_summed_over_streams(

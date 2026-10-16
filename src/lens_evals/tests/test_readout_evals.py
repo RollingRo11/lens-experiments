@@ -109,6 +109,14 @@ def test_min_rank_over_candidates() -> None:
     assert min_rank_over_candidates(logits_V, [3]) == 5
     # Min over candidates: {3, 2} -> best is token 2 (logit 4.0, rank 2).
     assert min_rank_over_candidates(logits_V, [3, 2]) == 2
+    # Ties count against the lens: a token tied with the best candidate is above it.
+    tied_V = torch.tensor([5.0, 3.0, 5.0, 5.0, 2.0])
+    assert min_rank_over_candidates(tied_V, [0]) == 3
+    # ...but the item's other candidates (other surface forms) do not.
+    assert min_rank_over_candidates(tied_V, [0, 2]) == 2
+    # A lens that gives every token the same score ranks the candidate last, not first.
+    assert min_rank_over_candidates(torch.zeros(5), [1]) == 5
+    assert min_rank_over_candidates(torch.tensor([1.0, float("nan"), 0.0]), [1]) == 3
 
 
 def test_non_semantic_token_ids_spares_candidates_and_ignores_special_ids() -> None:

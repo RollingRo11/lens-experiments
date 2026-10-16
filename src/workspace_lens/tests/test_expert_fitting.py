@@ -24,6 +24,9 @@ The pins that matter, in order of strength:
    ``row_sum_e / count_e``; ``ExpertJacobians.from_sums`` applies the
    starved-expert fallback at its threshold and ``ExpertJacobians`` round-trips
    through fp16 storage.
+9. Partitions keyed by name: two partitions with the same K share one fit, each
+   equal to its own single fit, with one checkpoint per name, and resume; a
+   random position partition has equal bucket sizes and its fit counts match.
 """
 
 from __future__ import annotations
@@ -56,6 +59,9 @@ from workspace_lens.routing.cluster import (
 from workspace_lens.routing.router import (
     ActivationRouterCollection,
     LayerActivationRouter,
+    PositionPartitionRouter,
+    load_router,
+    random_position_partition,
 )
 from workspace_lens.tests.fixtures import (
     exact_rows_per_source_PFN,
@@ -896,3 +902,105 @@ def test_expert_jacobians_from_sums_and_round_trip(
         assert torch.equal(
             loaded.fallback_L_dict_Bool_E[layer], experts.fallback_L_dict_Bool_E[layer]
         )
+
+
+def test_named_partitions_with_the_same_k_share_one_fit(
+    model: TinyDecoder,
+    fitted_router_collections_K_dict: dict[int, ActivationRouterCollection],
+    tmp_path: Path,
+) -> None:
+    """Two partitions with the same K, keyed by name, fit in one pass: each equals its own
+    single-partition fit, each writes experts_<name>_checkpoint.pt, and the run resumes from
+    those files. An int-keyed partition keeps the K-named file."""
+    random_router = random_position_partition(
+        [model.encode(prompt, max_length=64)[0] for prompt in PROMPTS],
+        num_clusters=2,
+        layers=SOURCE_LAYERS,
+        skip_first_n_positions=16,
+        seed=0,
+    )
+    partitions = {"kmeans2": fitted_router_collections_K_dict[2], "random2_s0": random_router, 3: fitted_router_collections_K_dict[3]}
+    trainer = ExpertJacobianTrainer(
+        make_tiny_lens_config(tmp_path, "named"), model, prompts=list(PROMPTS), router_collections_K_dict=partitions
+    )
+    trainer.fit()
+    checkpoint_dir = Path(trainer.config.checkpoint_path)
+    for name in ("kmeans2", "random2_s0", 3):
+        assert (checkpoint_dir / expert_checkpoint_filename(name)).exists()
+    assert expert_checkpoint_filename(3) == "experts_K3_checkpoint.pt"
+    state = torch.load(checkpoint_dir / expert_checkpoint_filename("random2_s0"), weights_only=True)
+    assert state["partition"] == "random2_s0" and state["num_clusters"] == 2
+    for name, router in partitions.items():
+        single = ExpertJacobianTrainer(
+            make_tiny_lens_config(tmp_path, f"single-{name}"), model, prompts=list(PROMPTS),
+            router_collections_K_dict={name: router},
+        )
+        single.fit()
+        for layer in SOURCE_LAYERS:
+            ours, theirs = trainer.fit_sums_K_dict[name].layer_sums_L_dict[layer], single.fit_sums_K_dict[name].layer_sums_L_dict[layer]
+            torch.testing.assert_close(ours.weighted_jacobian_row_sum_EFN, theirs.weighted_jacobian_row_sum_EFN, atol=1e-6, rtol=1e-5)
+            assert torch.equal(ours.position_count_E, theirs.position_count_E)
+    resumed = ExpertJacobianTrainer.from_checkpoint_dir(
+        str(checkpoint_dir), list(PROMPTS), router_collections_K_dict=partitions, model=model
+    )
+    for name in partitions:
+        for layer in SOURCE_LAYERS:
+            assert torch.equal(
+                resumed.fit_sums_K_dict[name].layer_sums_L_dict[layer].weighted_jacobian_row_sum_EFN,
+                trainer.fit_sums_K_dict[name].layer_sums_L_dict[layer].weighted_jacobian_row_sum_EFN,
+            )
+    # Two keys naming the same file are refused.
+    with pytest.raises(ValueError, match="distinct names"):
+        ExpertJacobianTrainer(
+            make_tiny_lens_config(tmp_path, "clash"), model, prompts=[],
+            router_collections_K_dict={2: fitted_router_collections_K_dict[2], "K2": random_router},
+        )
+
+
+def test_random_position_partition_has_equal_buckets_and_matches_the_fit(
+    model: TinyDecoder, tmp_path: Path
+) -> None:
+    """Every fit position gets a bucket, the buckets differ in size by at most one at every
+    layer, the draw depends on the seed only, and a fit under it counts exactly the router's
+    buckets. Positions it never labelled and prompts it was not built for are errors."""
+    input_ids_list_S = [model.encode(prompt, max_length=64)[0] for prompt in PROMPTS]
+    router = random_position_partition(
+        input_ids_list_S, num_clusters=3, layers=SOURCE_LAYERS, skip_first_n_positions=16, seed=1
+    )
+    again = random_position_partition(
+        input_ids_list_S, num_clusters=3, layers=SOURCE_LAYERS, skip_first_n_positions=16, seed=1
+    )
+    other_seed = random_position_partition(
+        input_ids_list_S, num_clusters=3, layers=SOURCE_LAYERS, skip_first_n_positions=16, seed=2
+    )
+    for layer in SOURCE_LAYERS:
+        labels_PS = router.labels_L_dict_PS[layer]
+        sizes = torch.bincount(labels_PS[labels_PS >= 0], minlength=3)
+        assert int(sizes.max() - sizes.min()) <= 1
+        assert torch.equal(labels_PS, again.labels_L_dict_PS[layer])
+        assert not torch.equal(labels_PS, other_seed.labels_L_dict_PS[layer])
+    assert not torch.equal(router.labels_L_dict_PS[0], router.labels_L_dict_PS[1])
+
+    path = tmp_path / "random_router.pt"
+    router.save(str(path))
+    loaded = load_router(str(path))
+    assert isinstance(loaded, PositionPartitionRouter) and loaded.num_clusters == 3
+    assert torch.equal(loaded.labels_L_dict_PS[2], router.labels_L_dict_PS[2])
+
+    trainer = ExpertJacobianTrainer(
+        make_tiny_lens_config(tmp_path, "random"), model, prompts=list(PROMPTS),
+        router_collections_K_dict={"random3": loaded},
+    )
+    trainer.fit()
+    for layer in SOURCE_LAYERS:
+        labels_PS = router.labels_L_dict_PS[layer]
+        assert trainer.fit_sums_K_dict["random3"].layer_sums_L_dict[layer].position_count_E.tolist() == torch.bincount(
+            labels_PS[labels_PS >= 0], minlength=3
+        ).tolist()
+
+    with pytest.raises(ValueError, match="did not label"):
+        router.assign_prompt_positions(input_ids_list_S[0], torch.tensor([0]), SOURCE_LAYERS[0])
+    with pytest.raises(KeyError):
+        router.assign_prompt_positions(model.encode("zzz " * 20, max_length=64)[0], torch.tensor([17]), SOURCE_LAYERS[0])
+    with pytest.raises(TypeError):
+        router.assign(torch.zeros(2, D_MODEL), SOURCE_LAYERS[0])

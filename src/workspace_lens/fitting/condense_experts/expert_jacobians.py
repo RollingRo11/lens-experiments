@@ -183,6 +183,73 @@ class ExpertJacobians:
             min_kept_positions=0,
         )
 
+    def collapse_fallbacks(self) -> ExpertJacobians:
+        """The same experts with every layer's fallback slots (experts that kept fewer than
+        ``min_kept_positions`` positions, each a copy of the pooled Jacobian) merged into one
+        pooled slot at the end, so a weight search sees one pooled expert instead of many
+        identical ones (a router with 191 clusters at every layer but 3 at some layer leaves
+        188 copies there). The set of lenses the weights can reach is unchanged: weights on
+        identical experts only ever act through their sum. Layers with no fallback are kept
+        as they are, so the number of experts can differ between layers. The pooled slot's
+        count and weight sum are those of the clusters it replaces."""
+        experts_L_dict_EFN: dict[int, t.Tensor] = {}
+        position_counts_L_dict_E: dict[int, t.Tensor] = {}
+        weight_sums_L_dict_E: dict[int, t.Tensor] = {}
+        fallback_L_dict_Bool_E: dict[int, t.Tensor] = {}
+        for layer in self.layers:
+            fallback_Bool_E = self.fallback_L_dict_Bool_E[layer].bool()
+            experts_EFN = self.experts_L_dict_EFN[layer]
+            counts_E = self.position_counts_L_dict_E[layer]
+            weight_sums_E = self.weight_sums_L_dict_E[layer]
+            if not bool(fallback_Bool_E.any()):
+                experts_L_dict_EFN[layer] = experts_EFN
+                position_counts_L_dict_E[layer] = counts_E
+                weight_sums_L_dict_E[layer] = weight_sums_E
+                fallback_L_dict_Bool_E[layer] = fallback_Bool_E
+                continue
+            kept_Bool_E = ~fallback_Bool_E
+            pooled_1FN = self.pooled_jacobian_L_dict_FN[layer][None].to(experts_EFN)
+            experts_L_dict_EFN[layer] = t.cat([experts_EFN[kept_Bool_E], pooled_1FN])
+            position_counts_L_dict_E[layer] = t.cat(
+                [counts_E[kept_Bool_E], counts_E[fallback_Bool_E].sum()[None]]
+            )
+            weight_sums_L_dict_E[layer] = t.cat(
+                [weight_sums_E[kept_Bool_E], weight_sums_E[fallback_Bool_E].sum()[None]]
+            )
+            fallback_L_dict_Bool_E[layer] = t.cat(
+                [t.zeros(int(kept_Bool_E.sum()), dtype=t.bool), t.ones(1, dtype=t.bool)]
+            )
+        return dataclasses.replace(
+            self,
+            experts_L_dict_EFN=experts_L_dict_EFN,
+            position_counts_L_dict_E=position_counts_L_dict_E,
+            weight_sums_L_dict_E=weight_sums_L_dict_E,
+            fallback_L_dict_Bool_E=fallback_L_dict_Bool_E,
+        )
+
+    def layer_summary(self) -> dict[int, dict[str, object]]:
+        """Per layer, for logs and stamps: the number of expert slots, of clusters that got
+        any fit position (``populated``) and of those that kept enough positions to be their
+        own expert (``own_jacobian``), the fallback slots, the share of the routed fit
+        positions that sit in fallback clusters (``fallback_position_fraction``), and the
+        position count of every slot."""
+        summary: dict[int, dict[str, object]] = {}
+        for layer in self.layers:
+            counts_E = self.position_counts_L_dict_E[layer].long()
+            fallback_Bool_E = self.fallback_L_dict_Bool_E[layer].bool()
+            total = int(counts_E.sum())
+            summary[layer] = {
+                "slots": int(counts_E.numel()),
+                "populated": int((counts_E > 0).sum()),
+                "own_jacobian": int((~fallback_Bool_E).sum()),
+                "fallback_slots": int(fallback_Bool_E.sum()),
+                "fallback_position_fraction": (
+                    float(counts_E[fallback_Bool_E].sum()) / total if total else 0.0
+                ),
+                "counts": counts_E.tolist(),
+            }
+        return summary
+
     def combine(
         self, weights_L_dict_E: Mapping[int, t.Tensor], *, checkpoint_name: str
     ) -> JacobianLens:

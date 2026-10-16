@@ -1,5 +1,5 @@
-"""Build the large swap dataset from RAVEL, the LRE relations and the hand-written templates
-of ``build_swap_dataset.py``.
+"""Build the large swap dataset from RAVEL, the LRE relations, the hand-written templates
+of ``build_swap_dataset.py`` and the extra sources of ``convert_extra_sources.py``.
 
 Every source becomes relations of the same shape: a list of prompt templates with a slot for
 the subject, and ``{subject: [answers]}``. An item swaps the lens vectors of subject X for
@@ -17,10 +17,23 @@ answer. Items are written in the probe-swap format (as in ``build_swap_dataset.p
 Filters, per relation and template (counts are printed): the subject is not a probe-swap or
 readout-eval word; it is one token where the template puts it (the swap needs one W_U row);
 the answer has a single-token surface (its first word, if it has several); Gemma already
-gives the answer (word rank below ``--max-rank`` on the clean prompt); a pair's answers share
-no token. Whole relations are held out: a seeded ``--heldout-fraction`` of each source's
-relations, plus the held-out domains of the hand-written set. Runs in the jpp_lens venv
-from the repo root, on a GPU.
+ranks the answer among its top ``--max-rank`` words on the clean prompt; a pair's answers
+share no token.
+
+Held-out relations. Every relation has a canonical ID (``relation_ids.py``: the Wikidata
+property where there is one, so the same relation from two sources is one ID). The split is
+drawn over canonical IDs, not per source: among the IDs with at least ``--min-eval-pairs``
+items, a seeded ``--heldout-fraction`` goes to ``test.json`` and a further
+``--dev-fraction`` to ``dev.json`` (for choosing anything, such as layer windows, without
+looking at the test relations); every other relation is in ``train.json``. Dev and test keep
+at most ``--max-eval-items-per-relation`` items per canonical ID.
+
+Each item records ``relation`` (the source's name), ``relation_id`` (canonical), the clean
+rank of its own answer (``clean_answer_rank``, 0 = Gemma's top word; the filter only asks
+for the top ``--max-rank``) and the clean rank of the swapped-in answer
+(``swap_answer_clean_rank``: 0 means Gemma already says it with no edit). Ranks are taken on
+fp32 logits before the soft-cap with formatting tokens removed, and a tie counts against the
+answer. Runs in the jpp_lens venv from the repo root, on a GPU.
 """
 
 from __future__ import annotations
@@ -39,9 +52,9 @@ sys.path.insert(0, "scripts")
 
 from build_swap_dataset import (  # noqa: E402
     DOMAINS,
-    HELDOUT_DOMAINS,
     excluded_words,
 )
+from relation_ids import canonical_relation_id  # noqa: E402
 
 from jlens.hooks import ActivationRecorder  # noqa: E402
 from lens_evals.eval_utils import (  # noqa: E402
@@ -106,17 +119,18 @@ def lre_relations(lre_dir: Path) -> list[Relation]:
     return relations
 
 
-def handwritten_relations() -> list[tuple[Relation, bool]]:
+def handwritten_relations() -> list[Relation]:
     relations = []
-    for domain, templates in DOMAINS.items():
+    for templates in DOMAINS.values():
         for name, template, facts in templates:
-            relation = Relation(
-                "handwritten",
-                f"handwritten:{name}",
-                [template.replace("{x}", SLOT)],
-                {word: [answer] if isinstance(answer, str) else list(answer) for word, answer in facts.items()},
+            relations.append(
+                Relation(
+                    "handwritten",
+                    f"handwritten:{name}",
+                    [template.replace("{x}", SLOT)],
+                    {word: [answer] if isinstance(answer, str) else list(answer) for word, answer in facts.items()},
+                )
             )
-            relations.append((relation, domain in HELDOUT_DOMAINS))
     return relations
 
 
@@ -157,18 +171,19 @@ def answer_token_ids(tokenizer, answers: list[str]) -> list[int]:
 
 @t.no_grad()
 def answer_word_ranks(
-    model, prompts: list[str], answer_ids_list: list[list[int]], formatting_mask_Bool_V: t.Tensor,
+    model, prompts: list[str], answer_id_sets: list[list[list[int]]], formatting_mask_Bool_V: t.Tensor,
     *, batch_size: int = 128,
-) -> list[int]:
-    """Per prompt, the best rank of its answer ids in the model's next-token distribution,
-    formatting tokens removed (probe-swap's word rank). Batched with right-padding (the model is
-    causal, so a row's last real position never sees the padding), on fp32 logits before the
-    soft-cap so that no two tokens tie."""
+) -> list[list[int]]:
+    """Per prompt, for each of its answer-id sets, the rank of the set's best id among the
+    model's next words: the number of other words whose logit is at least as high (0 = the
+    top word; a tie counts against the answer), formatting tokens removed (probe-swap's word
+    rank). Batched with right-padding (the model is causal, so a row's last real position
+    never sees the padding), on fp32 logits before the soft-cap."""
     final_layer = model.n_layers - 1
     unembed_VF = model._lm_head.weight.float()
     mask_Bool_V = formatting_mask_Bool_V.to(unembed_VF.device)
     pad_id = getattr(model.tokenizer, "pad_token_id", None) or 0
-    ranks: list[int] = []
+    ranks: list[list[int]] = []
     for start in range(0, len(prompts), batch_size):
         rows = [model.encode(prompt, max_length=512)[0].cpu() for prompt in prompts[start : start + batch_size]]
         last_Int_B = t.tensor([len(row) - 1 for row in rows], device=unembed_VF.device)
@@ -177,9 +192,13 @@ def answer_word_ranks(
             model.forward(input_ids_Int_BS.to(model.input_device))
             final_BF = recorder.activations[final_layer][t.arange(len(rows), device=last_Int_B.device), last_Int_B]
         logits_BV = (model._final_norm(final_BF.float()) @ unembed_VF.T).masked_fill(mask_Bool_V, float("-inf"))
-        for row_idx, answer_ids in enumerate(answer_ids_list[start : start + batch_size]):
-            best = logits_BV[row_idx, answer_ids].max()
-            ranks.append(int((logits_BV[row_idx] > best).sum()))
+        for row_idx, id_sets in enumerate(answer_id_sets[start : start + batch_size]):
+            row_ranks = []
+            for answer_ids in id_sets:
+                at_or_above_Bool_V = logits_BV[row_idx] >= logits_BV[row_idx, answer_ids].max()
+                at_or_above_Bool_V[answer_ids] = False
+                row_ranks.append(int(at_or_above_Bool_V.sum()))
+            ranks.append(row_ranks)
     return ranks
 
 
@@ -193,20 +212,50 @@ def load_extra_relations(paths: list[str]) -> list[Relation]:
     return relations
 
 
+def split_by_relation_id(
+    items: list[dict], *, heldout_fraction: float, dev_fraction: float, min_eval_pairs: int,
+    max_eval_items_per_relation: int, rng: random.Random,
+) -> tuple[dict[str, list[dict]], dict[str, str]]:
+    """``({"train", "dev", "test"} -> items, relation_id -> split)``: the module docstring's
+    draw over canonical IDs."""
+    items_by_id: dict[str, list[dict]] = {}
+    for item in items:
+        items_by_id.setdefault(item["relation_id"], []).append(item)
+    eligible = sorted(relation_id for relation_id, rows in items_by_id.items() if len(rows) >= min_eval_pairs)
+    rng.shuffle(eligible)
+    num_test, num_dev = round(heldout_fraction * len(eligible)), round(dev_fraction * len(eligible))
+    split_of_id = {relation_id: "train" for relation_id in items_by_id}
+    split_of_id.update({relation_id: "test" for relation_id in eligible[:num_test]})
+    split_of_id.update({relation_id: "dev" for relation_id in eligible[num_test : num_test + num_dev]})
+    splits: dict[str, list[dict]] = {"train": [], "dev": [], "test": []}
+    for relation_id in sorted(items_by_id):
+        rows = items_by_id[relation_id]
+        split = split_of_id[relation_id]
+        if split != "train" and len(rows) > max_eval_items_per_relation:
+            rows = rng.sample(rows, max_eval_items_per_relation)
+        splits[split].extend(rows)
+    for rows in splits.values():
+        rng.shuffle(rows)
+    return splits, split_of_id
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hf-model-name", default="google/gemma-4-E2B")
     parser.add_argument("--ravel-dir", required=True)
     parser.add_argument("--lre-dir", required=True, help="The relations repo's data/ folder.")
-    parser.add_argument(
-        "--extra-relations", nargs="*", default=[], help="More relation JSON files (one held-out draw per file)."
-    )
+    parser.add_argument("--extra-relations", nargs="*", default=[], help="More relation JSON files.")
     parser.add_argument("--max-rank", type=int, default=10)
     parser.add_argument("--templates-per-relation", type=int, default=3)
     parser.add_argument("--subjects-per-relation", type=int, default=150)
     parser.add_argument("--pairs-per-template", type=int, default=150)
-    parser.add_argument("--heldout-fraction", type=float, default=0.25)
-    parser.add_argument("--max-heldout-items", type=int, default=1500)
+    parser.add_argument("--heldout-fraction", type=float, default=0.2, help="Share of canonical IDs in test.")
+    parser.add_argument("--dev-fraction", type=float, default=0.1, help="Share of canonical IDs in dev.")
+    parser.add_argument("--min-eval-pairs", type=int, default=20, help="Fewest items for a held-out ID.")
+    parser.add_argument("--max-eval-items-per-relation", type=int, default=100)
+    parser.add_argument(
+        "--max-heldout-items", type=int, default=None, help="Optional cap on the items of dev and of test."
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
@@ -218,17 +267,13 @@ def main() -> None:
     formatting_mask_Bool_V = token_id_mask_Bool_V(formatting_token_ids_of(tokenizer, vocab_size), vocab_size)
     excluded = excluded_words()
 
-    tagged: list[tuple[Relation, bool]] = handwritten_relations()
-    sources = [ravel_relations(Path(args.ravel_dir)), lre_relations(Path(args.lre_dir))]
-    sources += [load_extra_relations([path]) for path in args.extra_relations]
-    for relations in sources:
-        heldout_names = set(rng.sample([r.name for r in relations], round(args.heldout_fraction * len(relations))))
-        tagged += [(relation, relation.name in heldout_names) for relation in relations]
+    relations = handwritten_relations() + ravel_relations(Path(args.ravel_dir)) + lre_relations(Path(args.lre_dir))
+    relations += load_extra_relations(args.extra_relations)
 
-    splits: dict[str, list[dict]] = {"train": [], "heldout": []}
+    items: list[dict] = []
     stats = []
-    for relation, heldout in tagged:
-        split = "heldout" if heldout else "train"
+    for relation in relations:
+        relation_id = canonical_relation_id(relation.name)
         templates = relation.templates[:]
         rng.shuffle(templates)
         templates = templates[: args.templates_per_relation]
@@ -254,15 +299,15 @@ def main() -> None:
             ranks = answer_word_ranks(
                 model,
                 [render(template, subject) for subject, _, _ in candidates],
-                [answer_ids for _, _, answer_ids in candidates],
+                [[answer_ids] for _, _, answer_ids in candidates],
                 formatting_mask_Bool_V,
             )
-            known: dict[str, tuple[list[str], list[int]]] = {}
-            for (subject, answers, answer_ids), rank in zip(candidates, ranks, strict=True):
+            known: dict[str, tuple[list[str], list[int], int]] = {}
+            for (subject, answers, answer_ids), (rank,) in zip(candidates, ranks, strict=True):
                 if rank >= args.max_rank:
                     counts["unknown"] += 1
                     continue
-                known[subject] = (answers, answer_ids)
+                known[subject] = (answers, answer_ids, rank)
             counts["known"] += len(known)
             pairs = [
                 (subject, other)
@@ -273,11 +318,28 @@ def main() -> None:
             rng.shuffle(pairs)
             pairs = pairs[: args.pairs_per_template]
             counts["pairs"] += len(pairs)
+            # The swapped-in answer's clean rank on each pair's prompt: one pass per subject.
+            partners: dict[str, list[str]] = {}
             for subject, other in pairs:
-                splits[split].append(
+                partners.setdefault(subject, []).append(other)
+            swap_ranks = answer_word_ranks(
+                model,
+                [render(template, subject) for subject in partners],
+                [[known[other][1] for other in others] for others in partners.values()],
+                formatting_mask_Bool_V,
+            )
+            swap_rank_of = {
+                (subject, other): rank
+                for (subject, others), row_ranks in zip(partners.items(), swap_ranks, strict=True)
+                for other, rank in zip(others, row_ranks, strict=True)
+            }
+            for subject, other in pairs:
+                items.append(
                     {
                         "name": f"{relation.name}#{template_idx}:{subject}->{other}",
                         "category": relation.name,
+                        "relation": relation.name,
+                        "relation_id": relation_id,
                         "prompt": render(template, subject),
                         "intermediate": subject,
                         "swap_to": other,
@@ -285,22 +347,38 @@ def main() -> None:
                         "swap_answer": known[other][0][0],
                         "answer_surfaces": known[subject][0],
                         "swap_answer_surfaces": known[other][0],
+                        "clean_answer_rank": known[subject][2],
+                        "swap_answer_clean_rank": swap_rank_of[(subject, other)],
                     }
                 )
-        stats.append({"relation": relation.name, "split": split, "templates": len(templates), **counts})
-        print(f"{split:7s} {relation.name:55s} templates {len(templates)}  known {counts['known']:4d}  "
+        stats.append({"relation": relation.name, "relation_id": relation_id, "templates": len(templates), **counts})
+        print(f"{relation.name:55s} id {relation_id:26s} templates {len(templates)}  known {counts['known']:4d}  "
               f"pairs {counts['pairs']:4d}  (eval {counts['eval_word']}, multi-token {counts['multi_token']}, "
               f"no answer token {counts['no_answer_token']}, unknown {counts['unknown']})", flush=True)
 
-    rng.shuffle(splits["heldout"])
-    splits["heldout"] = splits["heldout"][: args.max_heldout_items]
+    splits, split_of_id = split_by_relation_id(
+        items, heldout_fraction=args.heldout_fraction, dev_fraction=args.dev_fraction,
+        min_eval_pairs=args.min_eval_pairs, max_eval_items_per_relation=args.max_eval_items_per_relation, rng=rng,
+    )
+    if args.max_heldout_items is not None:
+        for split in ("dev", "test"):
+            splits[split] = splits[split][: args.max_heldout_items]
+    for row in stats:
+        row["split"] = split_of_id.get(row["relation_id"], "train")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for split, items in splits.items():
-        (out_dir / f"{split}.json").write_text(json.dumps({"items": items}, indent=1))
-        words = {item["intermediate"] for item in items} | {item["swap_to"] for item in items}
-        print(f"{split}: {len(items)} pairs over {len({item['category'] for item in items})} relations, "
-              f"{len(words)} distinct swap words", flush=True)
+    for split, split_items in splits.items():
+        (out_dir / f"{split}.json").write_text(json.dumps({"items": split_items}, indent=1))
+        words = {item["intermediate"] for item in split_items} | {item["swap_to"] for item in split_items}
+        clean_top1 = sum(item["clean_answer_rank"] == 0 for item in split_items)
+        no_edit = sum(item["swap_answer_clean_rank"] == 0 for item in split_items)
+        relation_ids = sorted({item["relation_id"] for item in split_items})
+        print(f"{split}: {len(split_items)} pairs over {len({item['relation'] for item in split_items})} relations "
+              f"({len(relation_ids)} canonical IDs), {len(words)} distinct swap words; own answer top-1 on the clean "
+              f"prompt {clean_top1}/{len(split_items)}, swapped-in answer already top-1 with no edit "
+              f"{no_edit}/{len(split_items)}", flush=True)
+        if split != "train":
+            print(f"  {split} IDs: {relation_ids}", flush=True)
     (out_dir / "stats.json").write_text(json.dumps(stats, indent=1))
 
 

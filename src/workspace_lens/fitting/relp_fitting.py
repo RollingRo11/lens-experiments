@@ -41,7 +41,7 @@ from workspace_lens.lrp import (
     lrp_rule_config_for_mode,
 )
 from workspace_lens.lrp.lrp import hf_module_to_patch
-from workspace_lens.routing.router import ActivationRouterCollection
+from workspace_lens.routing.router import ActivationRouterCollection, PositionPartitionRouter
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ class ExpertJacobianRelPTrainer(ExpertJacobianTrainer):
         model: LensModel,
         prompts: list[str],
         *,
-        router_collections_K_dict: dict[int, ActivationRouterCollection],
+        router_collections_K_dict: dict[int | str, ActivationRouterCollection | PositionPartitionRouter],
         device: str = DEFAULT_DEVICE,
     ) -> None:
         super().__init__(

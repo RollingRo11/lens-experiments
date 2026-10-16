@@ -24,10 +24,19 @@ expert-vs-pooled comparisons are like-for-like — slightly different from
 :meth:`LensTrainer.fit`'s per-prompt-mean-then-prompt-mean, which weights
 every prompt equally.
 
-Routers. Each K's router is a per-layer
+Routers. Each partition's router is a per-layer
 :class:`~workspace_lens.routing.router.ActivationRouterCollection`: a position
 is routed at every layer from that layer's own activation
-(:meth:`ExpertJacobianTrainer._route_positions`).
+(:meth:`ExpertJacobianTrainer._route_positions`), or a
+:class:`~workspace_lens.routing.router.PositionPartitionRouter`, which looks the
+position up from the prompt instead (a random-bucket control).
+
+Partitions. The trainer fits several bucketings of the same positions in one
+run. Each is keyed either by its cluster count K (an int, the original keying,
+checkpoint ``experts_K<K>_checkpoint.pt``) or by a name (a string, checkpoint
+``experts_<name>_checkpoint.pt``), so several partitions with the same K (random
+seeds, two clusterings) can share the backward passes
+(:func:`~workspace_lens.fitting.utils.partition_name`).
 
 Which positions enter at all is
 :func:`workspace_lens.utils.get_position_mask_with_early_skips` (the
@@ -64,11 +73,16 @@ from workspace_lens.fitting.utils import (
     ACTIVATION_COLLECTION_STAMP,
     checkpoint_router_stamp,
     expert_checkpoint_filename,
+    partition_name,
 )
 from workspace_lens.lenses.jacobian_lens import JacobianLens
 from workspace_lens.lrp import lrp_rule_config_for_mode
 from workspace_lens.residual_streams import residual_mean_over_streams
-from workspace_lens.routing.router import ActivationRouterCollection
+from workspace_lens.routing.router import ActivationRouterCollection, PositionPartitionRouter
+
+# A partition is keyed by its K (int) or by a name (str); see the module docstring.
+PartitionKey = int | str
+Router = ActivationRouterCollection | PositionPartitionRouter
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +101,20 @@ def _source_position_activations_PN(
 
 
 class ExpertJacobianTrainer(LensTrainer):
-    """Fits per-cluster Jacobians for one or more cluster counts K in one run.
+    """Fits per-cluster Jacobians for one or more partitions of the fit positions in one run
+    (``router_collections_K_dict`` maps each partition's key, its K or a name, to its router).
 
-    The backward passes (the entire GPU cost) are shared across Ks: each K
-    just buckets the same gradient rows differently, so fitting several Ks
-    costs one fit plus each K's accumulator memory. Row contributions are added
+    The backward passes (the entire GPU cost) are shared across partitions: each
+    just buckets the same gradient rows differently, so fitting several
+    costs one fit plus each partition's accumulator memory. Row contributions are added
     *directly* into the running accumulators — each backward pass covers a
     disjoint output-dim slice, so no per-prompt buffer is needed and CPU
     memory stays at one copy of the accumulators.
 
-    Checkpointing writes one file per K (:func:`expert_checkpoint_filename`,
+    Checkpointing writes one file per partition (:func:`expert_checkpoint_filename`,
     atomically overwritten in place), so downstream merging can load and
-    merge each K independently and in parallel. Each file is stamped with its
-    K's router geometry and the resolved LRP rule flags
+    merge each partition independently and in parallel. Each file is stamped with its
+    router's geometry and the resolved LRP rule flags
     (:meth:`write_checkpoint`), so shards fitted through any entry point (the
     trainers directly, ``scripts/jpp_cli.py fit-shard``) merge on identical
     stamps.
@@ -111,39 +126,47 @@ class ExpertJacobianTrainer(LensTrainer):
         model: LensModel,
         prompts: list[str],
         *,
-        router_collections_K_dict: dict[int, ActivationRouterCollection],
+        router_collections_K_dict: dict[PartitionKey, Router],
         device: str = DEFAULT_DEVICE,
     ) -> None:
         super().__init__(config, model, prompts, device=device)
 
         self._validate_router_collections(router_collections_K_dict)
 
-        self.router_collections_K_dict = dict(sorted(router_collections_K_dict.items()))
+        self.router_collections_K_dict = dict(
+            sorted(router_collections_K_dict.items(), key=lambda item: partition_name(item[0]))
+        )
 
-        self.fit_sums_K_dict: dict[int, ExpertFitSums] = {
-            num_clusters: ExpertFitSums.zeros(num_clusters, model.d_model, self.source_layers)
-            for num_clusters in self.router_collections_K_dict
+        self.fit_sums_K_dict: dict[PartitionKey, ExpertFitSums] = {
+            key: ExpertFitSums.zeros(router.num_clusters, model.d_model, self.source_layers)
+            for key, router in self.router_collections_K_dict.items()
         }
 
     ### VALIDATION AND INITIALIZATION
 
     def _validate_router_collections(
-        self, router_collections_K_dict: dict[int, ActivationRouterCollection]
+        self, router_collections_K_dict: dict[PartitionKey, Router]
     ) -> None:
-        """Every router's K matches its key and every collection covers every
-        source layer."""
-        for num_clusters, router in router_collections_K_dict.items():
-            if router.num_clusters != num_clusters:
+        """A partition keyed by an int K has a router with that K, partition names map to
+        distinct checkpoint files, and every router covers every source layer."""
+        names = [partition_name(key) for key in router_collections_K_dict]
+        if len(set(names)) != len(names):
+            raise ValueError(f"partitions must have distinct names (one checkpoint each), got {names}")
+        for key, router in router_collections_K_dict.items():
+            if isinstance(key, int) and router.num_clusters != key:
                 raise ValueError(
-                    f"router_collections_K_dict[{num_clusters}] has "
+                    f"router_collections_K_dict[{key}] has "
                     f"num_clusters={router.num_clusters}"
                 )
-            # A per-layer collection or a duck-typed stand-in for one (it needs
-            # `layer_routers_L_dict` keys and `assign(activations_PN, layer)`).
-            missing_layers = set(self.source_layers) - set(router.layer_routers_L_dict)
+            # A router's layers: `layers`, or the `layer_routers_L_dict` keys of a duck-typed
+            # stand-in for a collection (it needs those and `assign(activations_PN, layer)`).
+            router_layers = getattr(router, "layers", None)
+            if router_layers is None:
+                router_layers = list(router.layer_routers_L_dict)
+            missing_layers = set(self.source_layers) - set(router_layers)
             if missing_layers:
                 raise ValueError(
-                    f"router_collections_K_dict[{num_clusters}] has no router for source "
+                    f"router_collections_K_dict[{key!r}] has no router for source "
                     f"layers {sorted(missing_layers)}"
                 )
 
@@ -161,7 +184,7 @@ class ExpertJacobianTrainer(LensTrainer):
         *,
         prompt_idx: Optional[int] = None,  # noqa: UP045
     ) -> tuple[int, int]:
-        """Accumulate one prompt directly into the running sums (all Ks).
+        """Accumulate one prompt directly into the running sums (all partitions).
 
         Returns ``(seq_len, num_source_positions)``. Side effect: appends this
         prompt's position record (:meth:`LensTrainer._append_position_record`;
@@ -192,8 +215,8 @@ class ExpertJacobianTrainer(LensTrainer):
                     :current_pass_batch_dim, positions_on_device_Int_P, :
                 ].float()
 
-                for num_clusters in self.router_collections_K_dict:
-                    cluster_membership_EP = cluster_membership_K_dict_L_dict_EP[num_clusters][
+                for key in self.router_collections_K_dict:
+                    cluster_membership_EP = cluster_membership_K_dict_L_dict_EP[key][
                         layer
                     ].to(source_grad_BPN.device)
                     weighted_jacobian_row_sums_EBN = t.einsum(
@@ -202,7 +225,7 @@ class ExpertJacobianTrainer(LensTrainer):
 
                     # alias into the persistent accumulator: the += below mutates trainer state
                     running_layer_cluster_sums = self.fit_sums_K_dict[
-                        num_clusters
+                        key
                     ].layer_sums_L_dict[layer]
 
                     # Batch element b IS output row dim_start + b and passes
@@ -217,10 +240,10 @@ class ExpertJacobianTrainer(LensTrainer):
 
     def compute_cluster_memberships(
         self, forward_state: FitStepForward
-    ) -> dict[int, dict[int, t.Tensor]]:
+    ) -> dict[PartitionKey, dict[int, t.Tensor]]:
         """One prompt's routing, ahead of the backward passes.
 
-        Returns ``cluster_membership_K_dict_L_dict_EP``: per (K, layer) the
+        Returns ``cluster_membership_K_dict_L_dict_EP``: per (partition, layer) the
         ``[E, P]`` matrix whose entry (e, p) is 1 if position ``p`` routes to
         expert ``e`` and 0 otherwise.
 
@@ -231,22 +254,20 @@ class ExpertJacobianTrainer(LensTrainer):
         """
         # Cluster-membership matrices per (K, layer); counts and weight sums
         # accumulate immediately (they are per-prompt, not per-pass).
-        cluster_membership_K_dict_L_dict_EP: dict[int, dict[int, t.Tensor]] = {}
-        for num_clusters, router in self.router_collections_K_dict.items():
+        cluster_membership_K_dict_L_dict_EP: dict[PartitionKey, dict[int, t.Tensor]] = {}
+        for key, router in self.router_collections_K_dict.items():
             cluster_membership_L_dict_EP: dict[int, t.Tensor] = {}
             assignments_L_dict_P = self._route_positions(router, forward_state)
 
             for layer in self.source_layers:
                 assignments_Int_P = assignments_L_dict_P[layer]
-                cluster_indices_Int_E = t.arange(num_clusters, device=assignments_Int_P.device)
+                cluster_indices_Int_E = t.arange(router.num_clusters, device=assignments_Int_P.device)
                 cluster_membership_EP = (
                     assignments_Int_P[None, :] == cluster_indices_Int_E[:, None]
                 ).float()
                 cluster_membership_L_dict_EP[layer] = cluster_membership_EP
 
-                running_layer_cluster_sums = self.fit_sums_K_dict[
-                    num_clusters
-                ].layer_sums_L_dict[layer]
+                running_layer_cluster_sums = self.fit_sums_K_dict[key].layer_sums_L_dict[layer]
 
                 running_layer_cluster_sums.position_count_E += (
                     cluster_membership_EP.sum(dim=1).long().cpu()
@@ -255,17 +276,23 @@ class ExpertJacobianTrainer(LensTrainer):
                     cluster_membership_EP.sum(dim=1).float().cpu()
                 )
 
-            cluster_membership_K_dict_L_dict_EP[num_clusters] = cluster_membership_L_dict_EP
+            cluster_membership_K_dict_L_dict_EP[key] = cluster_membership_L_dict_EP
 
         return cluster_membership_K_dict_L_dict_EP
 
-    def _route_positions(
-        self, router: ActivationRouterCollection, forward_state: FitStepForward
-    ) -> dict[int, t.Tensor]:
+    def _route_positions(self, router: Router, forward_state: FitStepForward) -> dict[int, t.Tensor]:
         """Per source layer, the ``[P]`` expert index of every kept position
         under ``router``: each layer is routed from that layer's own activation at
-        the position."""
+        the position, or, for a router that assigns from the prompt and the position
+        (``assign_prompt_positions``), looked up from those."""
         source_positions_Int_P = forward_state.source_positions_Int_P
+        if hasattr(router, "assign_prompt_positions"):
+            return {
+                layer: router.assign_prompt_positions(
+                    forward_state.input_ids_Int_S, source_positions_Int_P, layer
+                )
+                for layer in self.source_layers
+            }
         return {
             layer: router.assign(
                 _source_position_activations_PN(source_block_output_BSrN, source_positions_Int_P),
@@ -282,12 +309,15 @@ class ExpertJacobianTrainer(LensTrainer):
         self.fit_step(prompt, prompt_idx=prompt_idx)
         logger.info(self._prompt_progress_line(prompt_idx, prompt_start_time))
 
-    def fit(self) -> dict[int, ExpertFitSums]:  # type: ignore[override]
-        """Fit all Ks over ``self.prompts``; returns each K's sufficient statistics
-        (:meth:`~workspace_lens.fitting.condense_experts.ExpertJacobians.from_sums`
-        turns them into expert Jacobians). The per-K checkpoints hold the same sums."""
+    def fit(self) -> dict[PartitionKey, ExpertFitSums]:  # type: ignore[override]
+        """Fit all partitions over ``self.prompts``; returns each partition's sufficient
+        statistics (:meth:`~workspace_lens.fitting.condense_experts.ExpertJacobians.from_sums`
+        turns them into expert Jacobians). The per-partition checkpoints hold the same sums."""
         logger.info(self.config)
-        logger.info("expert fit: Ks=%s", sorted(self.router_collections_K_dict))
+        logger.info(
+            "expert fit: partitions %s",
+            {partition_name(key): router.num_clusters for key, router in self.router_collections_K_dict.items()},
+        )
 
         self._run_prompt_loop()
         logger.info("expert fit: done, %d prompts", self.completed_prompt_count)
@@ -304,8 +334,8 @@ class ExpertJacobianTrainer(LensTrainer):
         return {"lrp_rules": lrp_rule_config_for_mode(self.config.lrp_mode).to_dict()}
 
     def write_checkpoint(self, *, final: bool = False) -> None:
-        """One file per K, atomically overwritten in place (bounded disk). Each
-        file describes its own sums: the config with that K's router geometry
+        """One file per partition, atomically overwritten in place (bounded disk). Each
+        file describes its own sums: the partition's name, the config with its router's geometry
         (:meth:`~workspace_lens.config.LensConfig.with_router`), the router's kind
         (:data:`~workspace_lens.fitting.utils.ACTIVATION_COLLECTION_STAMP`, under
         ``"router"``) plus :meth:`_extra_checkpoint_state`, so the merge can
@@ -313,24 +343,24 @@ class ExpertJacobianTrainer(LensTrainer):
         self.config.num_prompts_trained_on = self.completed_prompt_count
         self.config.next_prompt_idx = self.next_prompt_idx
         os.makedirs(self.config.checkpoint_path, exist_ok=True)
-        for num_clusters, router_collection in self.router_collections_K_dict.items():
+        for key, router_collection in self.router_collections_K_dict.items():
             checkpoint_config = self.config.with_router(
-                num_clusters=num_clusters, projection_dim=router_collection.projection_dim
+                num_clusters=router_collection.num_clusters,
+                projection_dim=router_collection.projection_dim,
             )
             self._atomic_save(
                 {
-                    "num_clusters": num_clusters,
+                    "num_clusters": router_collection.num_clusters,
+                    "partition": partition_name(key),
                     "config": checkpoint_config.to_dict(),
                     "router": ACTIVATION_COLLECTION_STAMP,
                     # Per fitted prompt: token hash and kept positions
                     # (LensTrainer._append_position_record).
                     "position_records": self.position_records,
                     **self._extra_checkpoint_state(),
-                    **self.fit_sums_K_dict[num_clusters].to_state_dict(),
+                    **self.fit_sums_K_dict[key].to_state_dict(),
                 },
-                os.path.join(
-                    self.config.checkpoint_path, expert_checkpoint_filename(num_clusters)
-                ),
+                os.path.join(self.config.checkpoint_path, expert_checkpoint_filename(key)),
             )
         self._write_position_records_json()
 
@@ -340,38 +370,35 @@ class ExpertJacobianTrainer(LensTrainer):
         checkpoint_dir: str,
         prompts: list[str],
         *,
-        router_collections_K_dict: dict[int, ActivationRouterCollection],
+        router_collections_K_dict: dict[PartitionKey, Router],
         model: LensModel | None = None,
         device: str = DEFAULT_DEVICE,
     ) -> ExpertJacobianTrainer:
-        """Resume from the per-K checkpoint files in ``checkpoint_dir``.
+        """Resume from the per-partition checkpoint files in ``checkpoint_dir``.
         ``prompts`` and ``router_collections_K_dict`` must be the ones the run started with."""
-        states: dict[int, dict] = {}
-        for num_clusters in sorted(router_collections_K_dict):
-            path = os.path.join(checkpoint_dir, expert_checkpoint_filename(num_clusters))
+        states: dict[PartitionKey, dict] = {}
+        for key in sorted(router_collections_K_dict, key=partition_name):
+            path = os.path.join(checkpoint_dir, expert_checkpoint_filename(key))
             if not os.path.exists(path):
                 raise FileNotFoundError(path)
-            states[num_clusters] = t.load(path, map_location="cpu", weights_only=True)
+            states[key] = t.load(path, map_location="cpu", weights_only=True)
 
         # A resume under a different router would mix two bucketings in one accumulator
         # and re-stamp the checkpoint, so the merge could no longer tell.
-        for num_clusters, state in states.items():
+        for key, state in states.items():
             stamp_of_checkpoint = checkpoint_router_stamp(state)
             if stamp_of_checkpoint != ACTIVATION_COLLECTION_STAMP:
                 raise ValueError(
-                    f"{checkpoint_dir} K={num_clusters} was fitted under router "
+                    f"{checkpoint_dir} {partition_name(key)} was fitted under router "
                     f"{stamp_of_checkpoint!r}, but the resume passes "
                     f"{ACTIVATION_COLLECTION_STAMP!r}"
                 )
 
-        configs = {
-            num_clusters: LensConfig.from_dict(state["config"])
-            for num_clusters, state in states.items()
-        }
+        configs = {key: LensConfig.from_dict(state["config"]) for key, state in states.items()}
         next_indices = {config.next_prompt_idx for config in configs.values()}
         if len(next_indices) != 1:
             raise ValueError(
-                f"per-K checkpoints disagree on next_prompt_idx: {sorted(next_indices)}"
+                f"per-partition checkpoints disagree on next_prompt_idx: {sorted(next_indices)}"
             )
         # The per-K files carry that K's router geometry (write_checkpoint);
         # the trainer's own config is K-agnostic, so reset the router fields.
@@ -389,8 +416,8 @@ class ExpertJacobianTrainer(LensTrainer):
             router_collections_K_dict=router_collections_K_dict,
             device=device,
         )
-        for num_clusters, state in states.items():
-            trainer.fit_sums_K_dict[num_clusters] = ExpertFitSums.from_state_dict(state)
+        for key, state in states.items():
+            trainer.fit_sums_K_dict[key] = ExpertFitSums.from_state_dict(state)
         trainer.completed_prompt_count = first_config.num_prompts_trained_on
         trainer.next_prompt_idx = first_config.next_prompt_idx
         trainer.position_records = list(first_state["position_records"])

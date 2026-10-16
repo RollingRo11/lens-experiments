@@ -160,6 +160,18 @@ def ranking_logits(model: LensModel, residual_PF: t.Tensor) -> t.Tensor:
     return logits_PV + bias_V.float() if bias_V is not None else logits_PV
 
 
+def final_norm_eps(model: LensModel) -> float:
+    """The ``eps`` of the model's final norm (``eps`` on Gemma's and LayerNorm's modules,
+    ``variance_epsilon`` on Llama-style RMSNorms); 0.0 when the model exposes no final norm
+    or the norm names none."""
+    final_norm = getattr(model, "_final_norm", None) or getattr(model, "norm", None)
+    for attribute_name in ("eps", "variance_epsilon"):
+        eps = getattr(final_norm, attribute_name, None)
+        if isinstance(eps, (int, float)):
+            return float(eps)
+    return 0.0
+
+
 def masked_lens_logits(
     model: LensModel,
     lens: BaseLens,

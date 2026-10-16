@@ -5,49 +5,54 @@ Everything here is a pure function of tensors: the pair table, the cached
 per-expert logits, the hit margins, and the macro means (exact and smooth).
 
 What the eval scores. A pair is an (item, intermediate); its rank under a lens
-is ``1 + #(logits > best candidate logit)`` with the excluded ids at ``-inf``
-(candidates are never excluded, see
-:class:`~workspace_lens.fitting.condense_experts.fitter.ExpertWeightingFitter`),
-and the
+is ``1 + #(non-candidate logits >= best candidate logit)`` with the excluded ids
+at ``-inf`` (candidates are never excluded, see
+:class:`~workspace_lens.fitting.condense_experts.fitter.ExpertWeightingFitter`):
+a token tied with the best candidate counts against the lens, and the pair's
+other candidates (other surface forms of the same word) count for nothing. The
 metric is the unweighted mean over evals of the pair hit rate ``rank <= k``.
 :func:`hit_margins` writes that rule as ``best candidate logit - k-th largest
-logit >= 0``, which is differentiable in the logits everywhere the rank is
-constant — the handle the smooth surrogate :func:`soft_macro_pass` needs.
+non-candidate logit > 0``, which is differentiable in the logits everywhere the
+rank is constant — the handle the smooth surrogate :func:`soft_macro_pass`
+needs.
 
 Why one cached tensor is enough. Under weights ``w`` the lens prediction for
 item ``p`` is ``x_p(w) = sum_e w_e J_e x_p = sum_e w_e T_pe`` (``T`` = the
-expert transports, computed once per layer). The model's unembed is RMSNorm
-followed by a linear head,
+expert transports, computed once per layer). The ranking logits are the model's
+final RMSNorm followed by its linear head, in fp32 and *before* any logit
+soft-cap (:func:`~workspace_lens.utils.ranking_logits`),
 
-    unembed(x) = W_U (g * x) / rms(x),        rms(x) = sqrt(mean(x^2) + eps),
+    logits(x) = W_U (g * x) / rms(x),        rms(x) = sqrt(mean(x^2) + eps),
 
-so multiplying it back by ``rms`` removes the only nonlinearity::
+so multiplying them back by ``rms`` removes the only nonlinearity::
 
-    unembed(x) * rms(x) = W_U diag(g) x       — linear in x.
+    logits(x) * rms(x) = W_U diag(g) x       — linear in x.
 
-:func:`expert_logits` therefore caches ``L_pe = unembed(T_pe) * rms(T_pe)``
+:func:`expert_logits` therefore caches ``L_pe = logits(T_pe) * rms(T_pe)``
 (``[P, E, V]``), and by linearity
 
-    L_p(w) = sum_e w_e L_pe = W_U diag(g) x_p(w) = unembed(x_p(w)) * rms(x_p(w)),
+    L_p(w) = sum_e w_e L_pe = W_U diag(g) x_p(w) = logits(x_p(w)) * rms(x_p(w)),
 
 which is the logits of the weighted prediction times the positive per-item
 scalar ``rms(x_p(w))``. Ranks ignore positive rescalings, so
 :func:`combined_logits` scores exactly what the eval would score, and the
 objective is *linear* in ``w`` — no separate rms tensor and no per-weight model
-pass.
+pass. This needs the head to be linear: a soft-cap (``cap * tanh(x / cap)``,
+Gemma) is not undone by the ``rms`` factor, and in bf16 it flattens every large
+logit to the same value, so the cache must be built from the uncapped fp32
+logits, never from ``model.unembed``.
 
 Two notes on the numerics:
 
-- ``rms`` as computed here omits the norm's ``eps``: the exact per-term factor
-  is ``sqrt(mean(T^2) + eps)``, so each term carries a relative error of
-  ``O(eps / mean(T^2))`` — at ``eps = 1e-6`` and residual-scale ``T``, far
-  below the gaps that decide ranks.
+- ``rms`` includes the norm's ``eps`` (``norm_eps``), so each cached term is
+  exactly ``W_U diag(g) T_pe`` up to fp32 rounding, even for weights that
+  nearly cancel.
 - The cache is fp32 with ``P`` x ``E`` x ``V`` entries per layer. It is freed
   before the next layer (:meth:`ExpertWeightingFitter.fit`).
 
-There is no runtime check that the unembed really is RMSNorm-then-linear;
-``tests/test_rank_objective.py`` pins the exactness with a
-fake RMSNorm model (``TinyDecoder`` has LayerNorm, for which the argument
+There is no runtime check that the ranking logits really are RMSNorm-then-linear;
+``tests/test_rank_objective.py`` pins the exactness with a fake RMSNorm model
+with a soft-capped head (``TinyDecoder`` has LayerNorm, for which the argument
 fails).
 """
 
@@ -116,24 +121,28 @@ def build_pair_table(
 
 @t.no_grad()
 def expert_logits(
-    unembed: Callable[[t.Tensor], t.Tensor],
+    ranking_logits_fn: Callable[[t.Tensor], t.Tensor],
     transports_PEF: t.Tensor,
     *,
+    norm_eps: float = 0.0,
     batch_size: int = 32,
 ) -> t.Tensor:
-    """``[P, E, V]`` fp32: ``L_pe = unembed(T_pe) * rms(T_pe)``, the model's
+    """``[P, E, V]`` fp32: ``L_pe = logits(T_pe) * rms(T_pe)``, the ranking
     logits of every expert's transport with the RMSNorm scaling multiplied back
     in (module docstring), so that ``sum_e w_e L_pe`` is a positive rescaling of
-    the logits of ``sum_e w_e T_pe``. The rms is computed in fp32 over
-    ``d_model`` and the unembed runs in ``batch_size``-item chunks."""
+    the logits of ``sum_e w_e T_pe``. ``ranking_logits_fn`` must be the fp32
+    final norm and linear head with no soft-cap
+    (:func:`~workspace_lens.utils.ranking_logits`); ``norm_eps`` is that norm's
+    ``eps``. The rms is computed in fp32 over ``d_model`` and the logits in
+    ``batch_size``-item chunks."""
     num_items, num_experts, d_model = transports_PEF.shape
-    rms_PE = transports_PEF.float().pow(2).mean(dim=-1).sqrt()
+    rms_PE = (transports_PEF.float().pow(2).mean(dim=-1) + norm_eps).sqrt()
     logit_chunks_list_BEV: list[t.Tensor] = []
     for start in range(0, num_items, batch_size):
         transports_chunk_BEF = transports_PEF[start : start + batch_size]
-        # unembed every (item, expert) transport as one row, then restore [B, E, V]
+        # every (item, expert) transport as one row, then restore [B, E, V]
         logits_BEV = (
-            unembed(transports_chunk_BEF.reshape(-1, d_model))
+            ranking_logits_fn(transports_chunk_BEF.reshape(-1, d_model).float())
             .reshape(transports_chunk_BEF.shape[0], num_experts, -1)
             .float()
         )
@@ -141,7 +150,7 @@ def expert_logits(
         # the transports live on the first: scale on the logits' device, then return the chunk on the
         # transports' device so the pair table and the weight fit downstream see one device.
         rms_chunk_BE1 = rms_PE[start : start + batch_size, :, None].to(logits_BEV.device)
-        logit_chunks_list_BEV.append((logits_BEV * rms_chunk_BE1).to(transports_PEF.device))
+        logit_chunks_list_BEV.append(logits_BEV.mul_(rms_chunk_BE1).to(transports_PEF.device))
     return t.cat(logit_chunks_list_BEV)
 
 
@@ -164,12 +173,13 @@ def hit_margins(
     excluded_mask_Bool_V: t.Tensor | None,
     k: int,
 ) -> tuple[t.Tensor, t.Tensor]:
-    """Per pair: ``(best candidate logit − k-th largest logit, logit std over
-    the vocab)``. The eval's rank is ``1 + #(logits > best candidate)`` with
-    excluded ids at ``-inf`` (candidates are never excluded), so a pair is a
-    hit (rank <= k) exactly when the margin is >= 0. The spread is that of the
-    unmasked logits; both are computed on the ``P`` item rows and then indexed
-    out per pair."""
+    """Per pair: ``(best candidate logit − k-th largest non-candidate logit,
+    logit std over the vocab)``. The eval's rank is ``1 + #(non-candidate logits
+    >= best candidate)`` with excluded ids at ``-inf`` (candidates are never
+    excluded), so a pair is a hit (rank <= k) exactly when the margin is
+    ``> 0``: a tie with the k-th non-candidate is a miss. The spread is that of
+    the unmasked logits; both are computed on the ``P`` item rows and then
+    indexed out per pair."""
     spread_P = logits_PV.std(dim=1).detach()
     if excluded_mask_Bool_V is not None:
         logits_PV = logits_PV.masked_fill(
@@ -177,7 +187,9 @@ def hit_margins(
         )
     logits_QV = logits_PV[pairs.item_index_Int_Q]
     best_candidate_Q = logits_QV.gather(1, pairs.candidate_ids_Int_QC).amax(dim=1)
-    kth_largest_Q = logits_QV.topk(k, dim=1).values[:, -1]
+    # The pair's own candidates never count against it (the padding repeats a candidate id).
+    non_candidate_logits_QV = logits_QV.scatter(1, pairs.candidate_ids_Int_QC, float("-inf"))
+    kth_largest_Q = non_candidate_logits_QV.topk(k, dim=1).values[:, -1]
     return best_candidate_Q - kth_largest_Q, spread_P[pairs.item_index_Int_Q]
 
 
@@ -193,8 +205,9 @@ def per_eval_mean(values_Q: t.Tensor, pairs: PairTable) -> t.Tensor:
 
 
 def exact_macro_pass(margin_Q: t.Tensor, pairs: PairTable) -> float:
-    """The eval's macro pass@k: the unweighted mean over evals of the hit rate."""
-    return float(per_eval_mean((margin_Q >= 0).float(), pairs).mean())
+    """The eval's macro pass@k: the unweighted mean over evals of the hit rate
+    (a hit is a margin ``> 0``, :func:`hit_margins`)."""
+    return float(per_eval_mean((margin_Q > 0).float(), pairs).mean())
 
 
 def soft_macro_pass(

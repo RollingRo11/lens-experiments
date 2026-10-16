@@ -87,11 +87,19 @@ def readout_position(input_ids_Int_1S: t.Tensor, tokenizer: Any, rule: str) -> i
 def min_rank_over_candidates(logits_V: t.Tensor, candidate_ids: Sequence[int]) -> int:
     """The best (lowest) rank any candidate token achieves under ``logits_V``.
 
-    Rank = 1 + number of strictly larger logits (ties resolve in the lens's
-    favour); the min over candidates is the rank of the highest-logit candidate.
+    Rank = 1 + number of non-candidate logits at or above the best candidate's: a
+    token tied with the best candidate counts against it, so a lens that gives
+    many tokens the same score gains nothing from the tie. The other candidates
+    (other surface forms of the same word) are not counted. A NaN best candidate
+    ranks last.
     """
-    best_candidate_logit = logits_V[list(candidate_ids)].max()
-    return int((logits_V > best_candidate_logit).sum().item()) + 1
+    candidate_ids = list(candidate_ids)
+    best_candidate_logit = logits_V[candidate_ids].max()
+    if bool(t.isnan(best_candidate_logit)):
+        return int(logits_V.numel())
+    at_or_above_Bool_V = logits_V >= best_candidate_logit
+    at_or_above_Bool_V[candidate_ids] = False
+    return int(at_or_above_Bool_V.sum().item()) + 1
 
 
 ### READOUT POSITION AND CANDIDATES (the runner's, shared by all its methods)
@@ -361,10 +369,11 @@ class ReadoutEvalRunner:
         Returns a long DataFrame: ``eval``, ``lens``, ``item``,
         ``intermediate``, ``layer``, ``rank``, ``n_candidates``. One forward
         pass per item records the residuals, which every lens then
-        transports; rank = 1 + strictly-greater count over the
-        exclusion-masked logits. Intermediates with no single-token
-        candidate surface are skipped and recorded in
-        :attr:`dropped_intermediates`.
+        transports; rank = 1 + the count of non-candidate logits at or
+        above the best candidate's (ties count against the lens,
+        :func:`min_rank_over_candidates`) over the exclusion-masked logits.
+        Intermediates with no single-token candidate surface are skipped and
+        recorded in :attr:`dropped_intermediates`.
         """
         # Columnar accumulation: the output has one row per (lens, item,
         # intermediate, layer), and a list of per-row dicts is severalfold

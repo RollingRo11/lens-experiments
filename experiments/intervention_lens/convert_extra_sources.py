@@ -1,7 +1,9 @@
 """Turn the extra swap-data sources into relation files for ``build_swap_dataset_v2.py
 --extra-relations``: a JSON list of ``{"source", "name", "templates" (with {x}), "facts":
 {subject: [answers]}}``. Every template must end where the answer goes (the swap is scored on
-the next token), and the subject slot is ``{x}``.
+the next token), and the subject slot is ``{x}``. Each relation also records its canonical
+``relation_id`` (``relation_ids.py``: the Wikidata property, or the ID it shares with another
+source's copy of the relation), which ``build_swap_dataset_v2.py`` holds out as one.
 
 - CounterFact (ROME, ``counterfact.json``): per Wikidata relation, its rewrite prompts (``{}`` ->
   ``{x}``) and each record's subject -> true target.
@@ -19,8 +21,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from relation_ids import canonical_relation_id  # noqa: E402
 
 LANGUAGES = {"fr": "French", "de": "German", "es": "Spanish"}
 MUSE_TEMPLATES = ["The {lang} word for {x} is", "In {lang}, the word {x} is", "Translated into {lang}, {x} is"]
@@ -137,6 +143,8 @@ def main() -> None:
     for source, relations in built.items():
         if relations is None:
             continue
+        for relation in relations:
+            relation["relation_id"] = canonical_relation_id(relation["name"])
         (out_dir / f"{source}.json").write_text(json.dumps(relations, ensure_ascii=False))
         n_facts = sum(len(relation["facts"]) for relation in relations)
         n_templates = sum(len(relation["templates"]) for relation in relations)
